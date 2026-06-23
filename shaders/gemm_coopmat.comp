@@ -1,0 +1,108 @@
+/*
+ * Portable subgroup-scope cooperative-matrix GEMM for Exynos (Xclipse) GPUs.
+ *
+ * Derived from the structure of jeffbolznv/vk_cooperative_matrix_perf
+ * (shaders/shmem.comp), but rewritten to maximize mobile-driver portability:
+ *   - No GL_EXT_buffer_reference / bufferDeviceAddress: plain SSBO bindings.
+ *   - No uvec4 shared-memory packing tricks: coopMatLoad reads straight from
+ *     global storage, so there are no 128-bit alignment constraints.
+ * This trades some peak throughput for far broader compatibility, which is the
+ * right call when probing a GPU whose feature support we can't test up front.
+ *
+ * Computes D = alpha*(A*B) + beta*C, with A (MxK), B (KxN), C/D (MxN), all
+ * row-major. Each subgroup owns a C_ROWS x C_COLS grid of lM x lN accumulators.
+ *
+ * Specialized at pipeline-creation time via the constant_ids below.
+ * Compile-time defines (set on the glslang command line):
+ *   A_TYPE = float16_t | int8_t | uint8_t | ...   (input element type)
+ *   C_TYPE = float16_t | float32_t | int32_t | ...(accumulator/output type)
+ */
+#version 450 core
+#pragma use_vulkan_memory_model
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_memory_scope_semantics : enable
+#extension GL_KHR_cooperative_matrix : enable
+#extension GL_EXT_shader_explicit_arithmetic_types : enable
+#extension GL_EXT_control_flow_attributes : enable
+
+// Cooperative-matrix shape advertised by the device (subgroup scope).
+layout(constant_id = 0) const uint lM = 16;
+layout(constant_id = 1) const uint lN = 16;
+layout(constant_id = 2) const uint lK = 16;
+
+// Full GEMM problem size.
+layout(constant_id = 3) const uint M = 4096;
+layout(constant_id = 4) const uint N = 4096;
+layout(constant_id = 5) const uint K = 4096;
+
+// Per-subgroup accumulator grid (number of lMxlN tiles each subgroup owns).
+layout(constant_id = 6) const uint C_ROWS = 2;
+layout(constant_id = 7) const uint C_COLS = 2;
+
+// Subgroup layout inside the workgroup (WG_W * WG_H subgroups per workgroup).
+layout(constant_id = 8) const uint WG_W = 4;
+layout(constant_id = 9) const uint WG_H = 2;
+
+layout(constant_id = 10) const float alpha = 1.0;
+layout(constant_id = 11) const float beta  = 0.0;
+
+// local_size_x is supplied by the host as WG_W*WG_H*subgroupSize.
+layout(local_size_x_id = 12, local_size_y = 1, local_size_z = 1) in;
+
+// Workgroup output tile, derived from the constants above.
+const uint TILE_M = WG_H * C_ROWS * lM;
+const uint TILE_N = WG_W * C_COLS * lN;
+
+layout(set = 0, binding = 0) readonly  buffer BufA { A_TYPE a[]; };
+layout(set = 0, binding = 1) readonly  buffer BufB { A_TYPE b[]; };
+layout(set = 0, binding = 2) readonly  buffer BufC { C_TYPE c[]; };
+layout(set = 0, binding = 3) writeonly buffer BufD { C_TYPE d[]; };
+
+void main()
+{
+    uvec2 tileID = uvec2(gl_WorkGroupID.xy);
+    uint  sgid   = gl_SubgroupID;
+    uvec2 warp   = uvec2(sgid % WG_W, sgid / WG_W);
+
+    // Accumulators start at zero.
+    coopmat<C_TYPE, gl_ScopeSubgroup, lM, lN, gl_MatrixUseAccumulator> acc[C_ROWS][C_COLS];
+    [[unroll]] for (uint i = 0; i < C_ROWS; ++i) {
+        [[unroll]] for (uint j = 0; j < C_COLS; ++j) {
+            acc[i][j] = coopmat<C_TYPE, gl_ScopeSubgroup, lM, lN, gl_MatrixUseAccumulator>(0);
+        }
+    }
+
+    // March over K. A is loaded once per row and reused across the C_COLS
+    // columns; B is loaded once per column and reused across the C_ROWS rows.
+    for (uint k = 0; k < K; k += lK) {
+        coopmat<A_TYPE, gl_ScopeSubgroup, lM, lK, gl_MatrixUseA> matA[C_ROWS];
+        [[unroll]] for (uint i = 0; i < C_ROWS; ++i) {
+            uint gi = TILE_M * tileID.y + lM * (C_ROWS * warp.y + i);
+            coopMatLoad(matA[i], a, gi * K + k, K, gl_CooperativeMatrixLayoutRowMajor);
+        }
+
+        [[unroll]] for (uint j = 0; j < C_COLS; ++j) {
+            uint gj = TILE_N * tileID.x + lN * (C_COLS * warp.x + j);
+            coopmat<A_TYPE, gl_ScopeSubgroup, lK, lN, gl_MatrixUseB> matB;
+            coopMatLoad(matB, b, k * N + gj, N, gl_CooperativeMatrixLayoutRowMajor);
+
+            [[unroll]] for (uint i = 0; i < C_ROWS; ++i) {
+                acc[i][j] = coopMatMulAdd(matA[i], matB, acc[i][j]);
+            }
+        }
+    }
+
+    // D = alpha*acc + beta*C
+    [[unroll]] for (uint i = 0; i < C_ROWS; ++i) {
+        uint gi = TILE_M * tileID.y + lM * (C_ROWS * warp.y + i);
+        [[unroll]] for (uint j = 0; j < C_COLS; ++j) {
+            uint gj = TILE_N * tileID.x + lN * (C_COLS * warp.x + j);
+
+            coopmat<C_TYPE, gl_ScopeSubgroup, lM, lN, gl_MatrixUseAccumulator> matC;
+            coopMatLoad(matC, c, gi * N + gj, N, gl_CooperativeMatrixLayoutRowMajor);
+
+            acc[i][j] = C_TYPE(alpha) * acc[i][j] + C_TYPE(beta) * matC;
+            coopMatStore(acc[i][j], d, gi * N + gj, N, gl_CooperativeMatrixLayoutRowMajor);
+        }
+    }
+}

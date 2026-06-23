@@ -1,0 +1,10 @@
+.gradle/
+build/
+.cxx/
+.claude/
+local.properties
+upstream/
+*.iml
+.idea/
+report_email_draft.md
+report_email.eml
