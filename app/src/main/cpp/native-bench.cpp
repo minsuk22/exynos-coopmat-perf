@@ -1023,7 +1023,9 @@ static std::string runBenchmark(const std::string &shaderDir) {
                 }
 
                 uint32_t gx = N / tileN, gy = M / tileM;
-                const uint32_t repeats = 10;
+                // dim=1024 finishes too fast to time reliably, so run many more
+                // iterations there; larger dims already run long enough at 10.
+                const uint32_t repeats = (dim == 1024) ? 1000 : 10;
 
                 // Record compute command buffer.
                 vkBeginCommandBuffer(cmd, &bi);
