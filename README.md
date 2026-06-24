@@ -22,7 +22,8 @@ Results are shown on screen, written to logcat (tag `VKCOOP`), and saved to
 `Android/data/com.exynos.vkcoopmat/files/coopmat_report.txt`.
 
 For a detailed breakdown of the matrix operation and the data types it
-exercises, see [docs/matrix-operation-analysis.md](docs/matrix-operation-analysis.md).
+exercises, see [docs/matrix-operation-analysis.md](docs/matrix-operation-analysis.md)
+([한글](docs/matrix-operation-analysis.ko.md)).
 
 ## Differences from the upstream NVIDIA benchmark
 

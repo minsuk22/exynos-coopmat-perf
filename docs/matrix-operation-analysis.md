@@ -1,5 +1,7 @@
 # Matrix Operation & Data-Type Analysis
 
+> 한글 버전: [matrix-operation-analysis.ko.md](matrix-operation-analysis.ko.md)
+
 This document describes **what matrix operation this benchmark measures** and
 **which data types it exercises**, based on the actual source
 (`shaders/gemm_coopmat.comp` and `app/src/main/cpp/native-bench.cpp`).
