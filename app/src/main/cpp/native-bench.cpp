@@ -866,10 +866,16 @@ static std::string runBenchmark(const std::string &shaderDir) {
                 uint32_t tileN = wgW * cCols * lN;
                 uint32_t localX = wgW * wgH * reqSg;
 
-                // Sweep the problem size from 1024 to 8192 in steps of 1024
-                // (each dim rounded up to tile / lK multiples).
+                // Sweep the problem size: 1024..8192 in steps of 1024, plus the
+                // large 8096 x{2,4,8} points. Each dim is rounded up to tile/lK
+                // multiples; dims too large to allocate are skipped gracefully.
                 auto roundUp = [](uint32_t v, uint32_t a) { return (v + a - 1) / a * a; };
-                for (uint32_t dim = 1024; dim <= 8192; dim += 1024) {
+                std::vector<uint32_t> dims;
+                for (uint32_t d = 1024; d <= 8192; d += 1024) dims.push_back(d);
+                dims.push_back(8096u * 2);   // 16192
+                dims.push_back(8096u * 4);   // 32384
+                dims.push_back(8096u * 8);   // 64768 (huge; likely skipped on-device)
+                for (uint32_t dim : dims) {
                 uint32_t M = roundUp(dim, tileM);
                 uint32_t N = roundUp(dim, tileN);
                 uint32_t K = roundUp(dim, lK);
