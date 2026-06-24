@@ -100,6 +100,157 @@ tflops = flops / seconds / 1e12
 - **입력값** — fp16 오버플로 / 정밀도 문제를 피하기 위해 `-2..2`의 작은 정수로
   채웁니다 (`native-bench.cpp:661-666`).
 
+## 심화: int8 연산은 어떻게 처리되는가
+
+int8 경로가 셰이더 컴파일 → feature 게이팅 → shape 매칭 → 버퍼/입력 → 실행까지
+어떻게 흐르는지 단계별로 정리합니다.
+
+### 핵심 설계: 셰이더는 하나, 타입은 컴파일 타임 주입
+
+int8 전용 셰이더가 따로 있는 게 아니라, **단일 GLSL 소스
+(`gemm_coopmat.comp`)를 매크로로 특수화**합니다. 셰이더는 입력 타입을 `A_TYPE`,
+누산/출력 타입을 `C_TYPE`이라는 컴파일 정의로만 참조합니다:
+
+```glsl
+// gemm_coopmat.comp:56-59
+layout(set = 0, binding = 0) readonly  buffer BufA { A_TYPE a[]; };   // A_TYPE = int8_t
+layout(set = 0, binding = 1) readonly  buffer BufB { A_TYPE b[]; };   // A_TYPE = int8_t
+layout(set = 0, binding = 2) readonly  buffer BufC { C_TYPE c[]; };   // C_TYPE = int32_t
+layout(set = 0, binding = 3) writeonly buffer BufD { C_TYPE d[]; };   // C_TYPE = int32_t
+```
+
+```glsl
+// gemm_coopmat.comp:78, 86 — 입력은 A_TYPE(int8) 타일로 로드
+coopmat<A_TYPE, gl_ScopeSubgroup, lM, lK, gl_MatrixUseA> matA[C_ROWS];
+coopmat<A_TYPE, gl_ScopeSubgroup, lK, lN, gl_MatrixUseB> matB;
+
+// gemm_coopmat.comp:68, 90 — 누산기는 C_TYPE(int32), MulAdd로 곱-누산
+coopmat<C_TYPE, gl_ScopeSubgroup, lM, lN, gl_MatrixUseAccumulator> acc[C_ROWS][C_COLS];
+acc[i][j] = coopMatMulAdd(matA[i], matB, acc[i][j]);   // int8×int8 → int32 누산
+```
+
+즉 `coopMatMulAdd`가 **int8 입력을 곱해서 int32 누산기에 더하는** 하드웨어
+명령으로 그대로 매핑됩니다. 이게 INT8 양자화 추론의 표준 패턴(8비트 입력, 32비트
+누산으로 오버플로 방지)입니다.
+
+### 1단계: SPIR-V 컴파일 (s8, u8 두 변종 생성)
+
+```bash
+# build_shaders.sh:14-15
+"$GLSLANG" $TENV -DA_TYPE=int8_t  -DC_TYPE=int32_t  -V "$SRC" -o "$OUT/gemm_s8_s32.spv"
+"$GLSLANG" $TENV -DA_TYPE=uint8_t -DC_TYPE=uint32_t -V "$SRC" -o "$OUT/gemm_u8_u32.spv"
+```
+
+같은 소스로 부호 있는 `s8→s32`, 부호 없는 `u8→u32` 두 개의 SPIR-V를 만듭니다.
+
+### 2단계: 런타임 후보 등록
+
+```cpp
+// native-bench.cpp:199-204
+static const TypeCombo kCombos[] = {
+    { VK_COMPONENT_TYPE_FLOAT16_KHR, VK_COMPONENT_TYPE_FLOAT32_KHR, "gemm_fp16_fp32.spv", true  },
+    { VK_COMPONENT_TYPE_FLOAT16_KHR, VK_COMPONENT_TYPE_FLOAT16_KHR, "gemm_fp16_fp16.spv", true  },
+    { VK_COMPONENT_TYPE_SINT8_KHR,   VK_COMPONENT_TYPE_SINT32_KHR,  "gemm_s8_s32.spv",   false }, // ← int8
+    { VK_COMPONENT_TYPE_UINT8_KHR,   VK_COMPONENT_TYPE_UINT32_KHR,  "gemm_u8_u32.spv",   false }, // ← uint8
+};
+```
+
+`isFloat = false`로 표시되어 정수 경로로 분류됩니다. 바이트 크기는:
+
+```cpp
+// native-bench.cpp:150-151
+case VK_COMPONENT_TYPE_SINT8_KHR:
+case VK_COMPONENT_TYPE_UINT8_KHR: return 8;   // 입력 1바이트, 출력(int32)은 4바이트
+```
+
+### 3단계: int8 feature 게이팅
+
+int8을 쓰려면 드라이버가 8비트 연산/스토리지를 지원해야 합니다:
+
+```cpp
+// native-bench.cpp:384-386
+bool canInt = fCoop.cooperativeMatrix && fVMM.vulkanMemoryModel &&
+              fF16.shaderInt8 &&                  // 셰이더 내 8비트 정수 연산
+              f8Store.storageBuffer8BitAccess &&  // SSBO 8비트 접근
+              fSgsc.subgroupSizeControl && fSgsc.computeFullSubgroups;
+```
+
+지원되면 디바이스 생성 시 해당 feature만 켭니다:
+
+```cpp
+// native-bench.cpp:422, 424
+fF16.shaderInt8                = canInt ? VK_TRUE : VK_FALSE;
+f8Store.storageBuffer8BitAccess = canInt ? VK_TRUE : VK_FALSE;
+```
+
+`canInt`가 false면 `combo.isFloat == false`인 조합(s8/u8)은 전부 건너뜁니다:
+
+```cpp
+// native-bench.cpp:476-478
+for (const auto &combo : kCombos) {
+    if (combo.isFloat && !canFloat) continue;
+    if (!combo.isFloat && !canInt)  continue;   // ← int 미지원이면 int8 조합 skip
+```
+
+### 4단계: 디바이스가 광고하는 int8 shape 매칭
+
+후보 타입이 통과해도, GPU가 그 타입 조합을 **subgroup scope**로 실제 광고해야
+실행합니다:
+
+```cpp
+// native-bench.cpp:480-486
+for (const auto &c : coop) {
+    if (c.scope == VK_SCOPE_SUBGROUP_KHR &&
+        c.AType == combo.inputType  && c.BType == combo.inputType &&   // s8/s8
+        c.CType == combo.outputType && c.ResultType == combo.outputType) { // s32/s32
+        pl.shape = c; pl.found = true; break;   // 이 shape의 lM/lN/lK 사용
+    }
+}
+```
+
+### 5단계: int8 버퍼 크기 & 입력 채우기
+
+입력은 1바이트, 출력은 4바이트로 버퍼를 잡습니다(`inElem = 1, outElem = 4`):
+
+```cpp
+// native-bench.cpp:647-650
+makeBuf(bufA, (VkDeviceSize)M * K * inElem);   // int8: M*K*1 바이트
+makeBuf(bufB, (VkDeviceSize)K * N * inElem);
+makeBuf(bufC, (VkDeviceSize)M * N * outElem);  // int32: M*N*4 바이트
+makeBuf(bufD, (VkDeviceSize)M * N * outElem);
+```
+
+입력값은 정수 경로일 때 `int8_t`로 직접 기록합니다:
+
+```cpp
+// native-bench.cpp:659-667
+auto fillInput = [&](Buffer &b, uint32_t count) {
+    for (uint32_t i = 0; i < count; ++i) {
+        float v = (float)((i * 1664525u + 1013904223u) % 5) - 2.0f; // -2..2
+        if (combo.isFloat) {
+            if (inBits == 16) ((uint16_t *)b.ptr)[i] = floatToHalf(v * 0.5f);
+        } else {
+            ((int8_t *)b.ptr)[i] = (int8_t)((int)v);   // ← int8 입력 기록
+        }
+    }
+};
+```
+
+이후는 타입과 무관하게 공통 경로(device 버퍼로 업로드 → specialization
+constant로 lM/lN/lK 주입 → dispatch 10회 → TFLOPS 측정)를 탑니다.
+
+### 주의점 (코드상 미묘한 부분)
+
+`fillInput`의 정수 분기는 **u8 조합에서도 `int8_t`로 캐스팅**합니다
+(`native-bench.cpp:666`). `v`가 `-2..2`이므로 `-2, -1`은 바이트로 `0xFE, 0xFF`가
+되고, `u8`(unsigned)로 해석하면 `254, 255`가 됩니다. 즉 u8 입력은 의도한 "작은
+양수"가 아니라 일부 큰 값이 섞입니다.
+
+- 이 벤치마크는 **결과 정확도를 검증하지 않고 처리량(TFLOPS)만 측정**하므로
+  동작/측정에는 문제가 없습니다.
+- 다만 나중에 정확도 검증을 추가한다면 u8 경로는 `uint8_t`로, 값 범위도 `0..N`
+  으로 채우도록 고쳐야 합니다.
+
 ## 요약
 
 **GPU의 subgroup-scope cooperative-matrix 엔진을 이용한 GEMM
