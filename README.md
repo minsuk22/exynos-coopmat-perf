@@ -21,6 +21,9 @@ The app runs a headless Vulkan compute benchmark (no rendering) that:
 Results are shown on screen, written to logcat (tag `VKCOOP`), and saved to
 `Android/data/com.exynos.vkcoopmat/files/coopmat_report.txt`.
 
+For a detailed breakdown of the matrix operation and the data types it
+exercises, see [docs/matrix-operation-analysis.md](docs/matrix-operation-analysis.md).
+
 ## Differences from the upstream NVIDIA benchmark
 
 | Upstream | This port |
