@@ -1029,15 +1029,12 @@ static std::string runBenchmark(const std::string &shaderDir) {
                 vkBeginCommandBuffer(cmd, &bi);
                 vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayout, 0, 1, &descSet, 0, nullptr);
                 vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
+                // No barrier between dispatches: A/B inputs are unchanged and D
+                // is not verified, so the iterations run back-to-back and overlap
+                // (the tail of one fills the ramp-up of the next), measuring
+                // steady-state throughput instead of draining the GPU each time.
                 for (uint32_t i = 0; i < repeats; ++i) {
                     vkCmdDispatch(cmd, gx, gy, 1);
-                    if (i + 1 < repeats) {
-                        VkMemoryBarrier mb = { VK_STRUCTURE_TYPE_MEMORY_BARRIER };
-                        mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-                        mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
-                        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
-                    }
                 }
                 vkEndCommandBuffer(cmd);
 
