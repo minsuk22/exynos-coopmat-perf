@@ -866,16 +866,10 @@ static std::string runBenchmark(const std::string &shaderDir) {
                 uint32_t tileN = wgW * cCols * lN;
                 uint32_t localX = wgW * wgH * reqSg;
 
-                // Sweep the problem size: 1024..8192 in steps of 1024, plus the
-                // large 8096 x{2,4,8} points. Each dim is rounded up to tile/lK
-                // multiples; dims too large to allocate are skipped gracefully.
+                // Sweep the problem size from 1024 to 8192 in steps of 1024
+                // (each dim rounded up to tile / lK multiples).
                 auto roundUp = [](uint32_t v, uint32_t a) { return (v + a - 1) / a * a; };
-                std::vector<uint32_t> dims;
-                for (uint32_t d = 1024; d <= 8192; d += 1024) dims.push_back(d);
-                dims.push_back(8096u * 2);   // 16192
-                dims.push_back(8096u * 4);   // 32384
-                dims.push_back(8096u * 8);   // 64768 (huge; likely skipped on-device)
-                for (uint32_t dim : dims) {
+                for (uint32_t dim = 1024; dim <= 8192; dim += 1024) {
                 uint32_t M = roundUp(dim, tileM);
                 uint32_t N = roundUp(dim, tileN);
                 uint32_t K = roundUp(dim, lK);
@@ -1061,11 +1055,31 @@ static std::string runBenchmark(const std::string &shaderDir) {
                 auto t1 = std::chrono::high_resolution_clock::now();
 
                 double sec = std::chrono::duration<double>(t1 - t0).count();
-                double flops = 2.0 * (double)M * (double)N * (double)K * (double)repeats;
-                double tflops = flops / sec / 1e12;
 
-                rep.line("  tile %ux%u (sg=%ux%u x%u, inv=%u, dim=%ux%ux%u): %.3f TFLOPS",
-                         tileM, tileN, wgW, wgH, reqSg, localX, M, N, K, tflops);
+                // Compute: multiply-add counted as 2 ops, summed over the run.
+                double ops = 2.0 * (double)M * (double)N * (double)K * (double)repeats;
+
+                // Modeled buffer_load traffic: with no shared-memory tiling, A is
+                // re-read once per output column-block and B once per row-block,
+                // while C is read once per output element. (Address-level load
+                // volume before L2 caching.)
+                double aLoadElems = (double)M * (double)N * (double)K / ((double)cCols * (double)lN);
+                double bLoadElems = (double)M * (double)N * (double)K / ((double)cRows * (double)lM);
+                double cLoadElems = (double)M * (double)N;
+                double loadBytes = ((aLoadElems + bLoadElems) * (double)inElem +
+                                    cLoadElems * (double)outElem) * (double)repeats;
+
+                double rate = ops / sec / 1e12;       // TFLOPS or TOPS
+                double bw   = loadBytes / sec / 1e9;   // GB/s
+                const char *opUnit   = combo.isFloat ? "GFLOP"  : "GOP";
+                const char *rateUnit = combo.isFloat ? "TFLOPS" : "TOPS";
+
+                rep.line("  dim=%ux%ux%u tile=%ux%u (sg=%ux%u x%u, inv=%u, %u iters):",
+                         M, N, K, tileM, tileN, wgW, wgH, reqSg, localX, repeats);
+                rep.line("      time    = %.3f ms (%.4f ms/iter)", sec * 1e3, sec * 1e3 / repeats);
+                rep.line("      compute = %.1f %s", ops / 1e9, opUnit);
+                rep.line("      load    = %.2f GB (buffer_load traffic, modeled)", loadBytes / 1e9);
+                rep.line("      => %.3f %s, %.1f GB/s", rate, rateUnit, bw);
 
                 vkDestroyPipeline(device, pipeline, nullptr);
                 freeBuf(bufA); freeBuf(bufB); freeBuf(bufC); freeBuf(bufD);
