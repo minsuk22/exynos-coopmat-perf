@@ -419,11 +419,35 @@ static void dumpPipelineExecutables(
 }
 
 // ---------------------------------------------------------------------------
+// Print the GLSL shader source (bundled alongside the SPIR-V) into the report,
+// so the report shows exactly what shader was compiled and run.
+// ---------------------------------------------------------------------------
+static void dumpShaderSource(const std::string &shaderDir, Report &rep) {
+    std::string path = shaderDir + "/gemm_coopmat.comp";
+    std::ifstream f(path, std::ios::binary | std::ios::ate);
+    rep.line("");
+    if (!f) {
+        rep.line("(shader source not bundled: %s)", path.c_str());
+        return;
+    }
+    std::streamsize sz = f.tellg();
+    f.seekg(0);
+    std::string src((size_t)(sz > 0 ? sz : 0), '\0');
+    if (sz > 0) f.read(&src[0], sz);
+    rep.line("==== Shader source: gemm_coopmat.comp (%ld bytes) ====", (long)sz);
+    rep.line("(generic GEMM; specialized per type via -DA_TYPE / -DC_TYPE at compile time)");
+    rep.raw(src);
+    if (src.empty() || src.back() != '\n') rep.raw("\n");
+    rep.line("==== end shader source ====");
+}
+
+// ---------------------------------------------------------------------------
 // The actual benchmark.
 // ---------------------------------------------------------------------------
 static std::string runBenchmark(const std::string &shaderDir) {
     Report rep;
     rep.line("=== Exynos Cooperative-Matrix GEMM Benchmark ===");
+    dumpShaderSource(shaderDir, rep);
 
     VkInstance instance = VK_NULL_HANDLE;
     VkDevice device = VK_NULL_HANDLE;
@@ -842,9 +866,10 @@ static std::string runBenchmark(const std::string &shaderDir) {
                 uint32_t tileN = wgW * cCols * lN;
                 uint32_t localX = wgW * wgH * reqSg;
 
-                // Problem size: ~2048, rounded up to tile / lK multiples.
+                // Sweep the problem size from 1024 to 8192 in steps of 1024
+                // (each dim rounded up to tile / lK multiples).
                 auto roundUp = [](uint32_t v, uint32_t a) { return (v + a - 1) / a * a; };
-                uint32_t dim = 2048;
+                for (uint32_t dim = 1024; dim <= 8192; dim += 1024) {
                 uint32_t M = roundUp(dim, tileM);
                 uint32_t N = roundUp(dim, tileN);
                 uint32_t K = roundUp(dim, lK);
@@ -1038,6 +1063,7 @@ static std::string runBenchmark(const std::string &shaderDir) {
 
                 vkDestroyPipeline(device, pipeline, nullptr);
                 freeBuf(bufA); freeBuf(bufB); freeBuf(bufC); freeBuf(bufD);
+                } // dim sweep
             } // cfg
 
             vkDestroyShaderModule(device, module, nullptr);
