@@ -95,6 +95,96 @@ typedef VkResult (VKAPI_PTR *PFN_vkGetPhysicalDeviceCooperativeMatrixPropertiesK
     VkPhysicalDevice, uint32_t*, VkCooperativeMatrixPropertiesKHR*);
 #endif // VK_KHR_cooperative_matrix
 
+// ---------------------------------------------------------------------------
+// Fallback definitions for VK_KHR_pipeline_executable_properties, used to dump
+// the driver's per-pipeline executables: statistics (register usage, etc.) and
+// internal representations (the GPU ISA / disassembly), when the driver exposes
+// them. Newer NDKs already define these.
+// ---------------------------------------------------------------------------
+#if !defined(VK_KHR_pipeline_executable_properties)
+#define VK_KHR_pipeline_executable_properties 1
+#define VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME "VK_KHR_pipeline_executable_properties"
+
+#define VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_EXECUTABLE_PROPERTIES_FEATURES_KHR ((VkStructureType)1000269000)
+#define VK_STRUCTURE_TYPE_PIPELINE_INFO_KHR ((VkStructureType)1000269001)
+#define VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_PROPERTIES_KHR ((VkStructureType)1000269002)
+#define VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_INFO_KHR ((VkStructureType)1000269003)
+#define VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_STATISTIC_KHR ((VkStructureType)1000269004)
+#define VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_INTERNAL_REPRESENTATION_KHR ((VkStructureType)1000269005)
+
+#define VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR ((VkPipelineCreateFlagBits)0x00000040)
+#define VK_PIPELINE_CREATE_CAPTURE_INTERNAL_REPRESENTATIONS_BIT_KHR ((VkPipelineCreateFlagBits)0x00000080)
+
+typedef struct VkPhysicalDevicePipelineExecutablePropertiesFeaturesKHR {
+    VkStructureType sType;
+    void* pNext;
+    VkBool32 pipelineExecutableInfo;
+} VkPhysicalDevicePipelineExecutablePropertiesFeaturesKHR;
+
+typedef struct VkPipelineInfoKHR {
+    VkStructureType sType;
+    const void* pNext;
+    VkPipeline pipeline;
+} VkPipelineInfoKHR;
+
+typedef struct VkPipelineExecutablePropertiesKHR {
+    VkStructureType sType;
+    void* pNext;
+    VkShaderStageFlags stages;
+    char name[VK_MAX_DESCRIPTION_SIZE];
+    char description[VK_MAX_DESCRIPTION_SIZE];
+    uint32_t subgroupSize;
+} VkPipelineExecutablePropertiesKHR;
+
+typedef struct VkPipelineExecutableInfoKHR {
+    VkStructureType sType;
+    const void* pNext;
+    VkPipeline pipeline;
+    uint32_t executableIndex;
+} VkPipelineExecutableInfoKHR;
+
+typedef enum VkPipelineExecutableStatisticFormatKHR {
+    VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_BOOL32_KHR = 0,
+    VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_INT64_KHR = 1,
+    VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_UINT64_KHR = 2,
+    VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_FLOAT64_KHR = 3,
+    VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_MAX_ENUM_KHR = 0x7FFFFFFF
+} VkPipelineExecutableStatisticFormatKHR;
+
+typedef union VkPipelineExecutableStatisticValueKHR {
+    VkBool32 b32;
+    int64_t  i64;
+    uint64_t u64;
+    double   f64;
+} VkPipelineExecutableStatisticValueKHR;
+
+typedef struct VkPipelineExecutableStatisticKHR {
+    VkStructureType sType;
+    void* pNext;
+    char name[VK_MAX_DESCRIPTION_SIZE];
+    char description[VK_MAX_DESCRIPTION_SIZE];
+    VkPipelineExecutableStatisticFormatKHR format;
+    VkPipelineExecutableStatisticValueKHR value;
+} VkPipelineExecutableStatisticKHR;
+
+typedef struct VkPipelineExecutableInternalRepresentationKHR {
+    VkStructureType sType;
+    void* pNext;
+    char name[VK_MAX_DESCRIPTION_SIZE];
+    char description[VK_MAX_DESCRIPTION_SIZE];
+    VkBool32 isText;
+    size_t dataSize;
+    void* pData;
+} VkPipelineExecutableInternalRepresentationKHR;
+
+typedef VkResult (VKAPI_PTR *PFN_vkGetPipelineExecutablePropertiesKHR)(
+    VkDevice, const VkPipelineInfoKHR*, uint32_t*, VkPipelineExecutablePropertiesKHR*);
+typedef VkResult (VKAPI_PTR *PFN_vkGetPipelineExecutableStatisticsKHR)(
+    VkDevice, const VkPipelineExecutableInfoKHR*, uint32_t*, VkPipelineExecutableStatisticKHR*);
+typedef VkResult (VKAPI_PTR *PFN_vkGetPipelineExecutableInternalRepresentationsKHR)(
+    VkDevice, const VkPipelineExecutableInfoKHR*, uint32_t*, VkPipelineExecutableInternalRepresentationKHR*);
+#endif // VK_KHR_pipeline_executable_properties
+
 #define ARRAY_LENGTH(x) (sizeof(x) / sizeof((x)[0]))
 
 // ---------------------------------------------------------------------------
@@ -111,6 +201,20 @@ struct Report {
         text += buf;
         text += '\n';
         ALOGI("%s", buf);
+    }
+    // Append a possibly large multi-line blob (e.g. ISA disassembly). The fixed
+    // buffer in line() would truncate it, and logcat truncates long lines, so we
+    // store it whole and echo it to logcat one line at a time.
+    void raw(const std::string &s) {
+        text += s;
+        size_t start = 0;
+        while (start < s.size()) {
+            size_t nl = s.find('\n', start);
+            size_t len = (nl == std::string::npos) ? s.size() - start : nl - start;
+            ALOGI("%.*s", (int)len, s.c_str() + start);
+            if (nl == std::string::npos) break;
+            start = nl + 1;
+        }
     }
 };
 
@@ -222,6 +326,99 @@ struct Buffer {
 };
 
 // ---------------------------------------------------------------------------
+// Dump a pipeline's executables via VK_KHR_pipeline_executable_properties:
+// per-executable statistics (register/VGPR/SGPR usage, spills, etc.) and
+// internal representations (the GPU ISA / disassembly text), when the driver
+// chooses to expose them. Quietly degrades to whatever the driver provides.
+// ---------------------------------------------------------------------------
+static void dumpPipelineExecutables(
+    VkDevice device, VkPipeline pipeline, Report &rep,
+    PFN_vkGetPipelineExecutablePropertiesKHR pProps,
+    PFN_vkGetPipelineExecutableStatisticsKHR pStats,
+    PFN_vkGetPipelineExecutableInternalRepresentationsKHR pIR) {
+    if (!pProps) return;
+
+    VkPipelineInfoKHR pi = { VK_STRUCTURE_TYPE_PIPELINE_INFO_KHR };
+    pi.pipeline = pipeline;
+    uint32_t numExec = 0;
+    if (pProps(device, &pi, &numExec, nullptr) != VK_SUCCESS || numExec == 0) {
+        rep.line("  [pipeline-exec] driver reported no executables");
+        return;
+    }
+    std::vector<VkPipelineExecutablePropertiesKHR> props(numExec);
+    for (auto &p : props) { p = {}; p.sType = VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_PROPERTIES_KHR; }
+    pProps(device, &pi, &numExec, props.data());
+
+    for (uint32_t e = 0; e < numExec; ++e) {
+        rep.line("  [exec %u] %s  (subgroupSize=%u)", e, props[e].name, props[e].subgroupSize);
+        if (props[e].description[0]) rep.line("    desc: %s", props[e].description);
+
+        VkPipelineExecutableInfoKHR ei = { VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_INFO_KHR };
+        ei.pipeline = pipeline;
+        ei.executableIndex = e;
+
+        // --- Statistics (register usage, occupancy, spills, ...) ---
+        if (pStats) {
+            uint32_t numStat = 0;
+            pStats(device, &ei, &numStat, nullptr);
+            if (numStat == 0) {
+                rep.line("    (no statistics exposed)");
+            } else {
+                std::vector<VkPipelineExecutableStatisticKHR> stats(numStat);
+                for (auto &s : stats) { s = {}; s.sType = VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_STATISTIC_KHR; }
+                pStats(device, &ei, &numStat, stats.data());
+                for (const auto &st : stats) {
+                    switch (st.format) {
+                    case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_BOOL32_KHR:
+                        rep.line("    stat: %-32s = %s", st.name, st.value.b32 ? "true" : "false"); break;
+                    case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_INT64_KHR:
+                        rep.line("    stat: %-32s = %lld", st.name, (long long)st.value.i64); break;
+                    case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_UINT64_KHR:
+                        rep.line("    stat: %-32s = %llu", st.name, (unsigned long long)st.value.u64); break;
+                    case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_FLOAT64_KHR:
+                        rep.line("    stat: %-32s = %f", st.name, st.value.f64); break;
+                    default: break;
+                    }
+                }
+            }
+        }
+
+        // --- Internal representations (the GPU ISA / disassembly) ---
+        if (pIR) {
+            uint32_t numIR = 0;
+            pIR(device, &ei, &numIR, nullptr);
+            if (numIR == 0) {
+                rep.line("    (no internal representations exposed; driver hides ISA)");
+                continue;
+            }
+            std::vector<VkPipelineExecutableInternalRepresentationKHR> irs(numIR);
+            for (auto &r : irs) { r = {}; r.sType = VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_INTERNAL_REPRESENTATION_KHR; }
+            // First pass: driver fills metadata + required dataSize per IR.
+            pIR(device, &ei, &numIR, irs.data());
+            std::vector<std::vector<char>> bufs(numIR);
+            for (uint32_t r = 0; r < numIR; ++r) {
+                bufs[r].resize(irs[r].dataSize ? irs[r].dataSize : 1);
+                irs[r].pData = bufs[r].data();
+            }
+            // Second pass: driver fills the actual data.
+            pIR(device, &ei, &numIR, irs.data());
+            for (uint32_t r = 0; r < numIR; ++r) {
+                rep.line("    --- IR: %s (%s, %zu bytes) ---", irs[r].name,
+                         irs[r].isText ? "text" : "binary", irs[r].dataSize);
+                if (irs[r].description[0]) rep.line("    desc: %s", irs[r].description);
+                if (irs[r].isText && irs[r].dataSize > 0) {
+                    // Text IRs are null-terminated; print the whole disassembly.
+                    rep.raw(std::string(bufs[r].data()));
+                    rep.raw("\n");
+                } else if (irs[r].dataSize > 0) {
+                    rep.line("    (binary IR, %zu bytes, not printed)", irs[r].dataSize);
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // The actual benchmark.
 // ---------------------------------------------------------------------------
 static std::string runBenchmark(const std::string &shaderDir) {
@@ -330,6 +527,28 @@ static std::string runBenchmark(const std::string &shaderDir) {
         rep.line("Subgroup size: %u (control range %u..%u)",
                  sgProps.subgroupSize, sgsc.minSubgroupSize, sgsc.maxSubgroupSize);
 
+        // --- Detect VK_KHR_pipeline_executable_properties (for ISA dump) ---
+        bool hasPipeExec = false;
+        {
+            uint32_t numExt = 0;
+            vkEnumerateDeviceExtensionProperties(pd, nullptr, &numExt, nullptr);
+            std::vector<VkExtensionProperties> exts(numExt);
+            vkEnumerateDeviceExtensionProperties(pd, nullptr, &numExt, exts.data());
+            for (auto &e : exts)
+                if (strcmp(e.extensionName, VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME) == 0)
+                    hasPipeExec = true;
+        }
+        VkPhysicalDevicePipelineExecutablePropertiesFeaturesKHR fPipeExec = {
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_EXECUTABLE_PROPERTIES_FEATURES_KHR };
+        if (hasPipeExec && pfnGetFeats2) {
+            VkPhysicalDeviceFeatures2 q = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &fPipeExec };
+            pfnGetFeats2(pd, &q);
+        }
+        bool wantPipeExec = hasPipeExec && fPipeExec.pipelineExecutableInfo;
+        rep.line("pipeline_executable_properties: ext=%s feature=%u -> ISA dump %s",
+                 hasPipeExec ? "yes" : "no", fPipeExec.pipelineExecutableInfo,
+                 wantPipeExec ? "ENABLED" : "unavailable");
+
         // --- Dump cooperative matrix shapes ---
         std::vector<VkCooperativeMatrixPropertiesKHR> coop;
         if (pfnGetCoopProps) {
@@ -433,6 +652,15 @@ static std::string runBenchmark(const std::string &shaderDir) {
 
         std::vector<const char *> devExts = { VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME };
 
+        // Enable pipeline-executable info so we can dump the compiled GPU ISA.
+        VkPhysicalDevicePipelineExecutablePropertiesFeaturesKHR fPipeExecEn = {
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_EXECUTABLE_PROPERTIES_FEATURES_KHR };
+        if (wantPipeExec) {
+            fPipeExecEn.pipelineExecutableInfo = VK_TRUE;
+            fSgsc.pNext = &fPipeExecEn;
+            devExts.push_back(VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME);
+        }
+
         float prio = 1.0f;
         VkDeviceQueueCreateInfo qci = { VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO };
         qci.queueFamilyIndex = (uint32_t)qfi;
@@ -455,6 +683,19 @@ static std::string runBenchmark(const std::string &shaderDir) {
 
         VkQueue queue;
         vkGetDeviceQueue(device, (uint32_t)qfi, 0, &queue);
+
+        // Resolve pipeline-executable entry points (only if we enabled them).
+        PFN_vkGetPipelineExecutablePropertiesKHR pfnPeProps = nullptr;
+        PFN_vkGetPipelineExecutableStatisticsKHR pfnPeStats = nullptr;
+        PFN_vkGetPipelineExecutableInternalRepresentationsKHR pfnPeIR = nullptr;
+        if (wantPipeExec) {
+            pfnPeProps = (PFN_vkGetPipelineExecutablePropertiesKHR)
+                vkGetDeviceProcAddr(device, "vkGetPipelineExecutablePropertiesKHR");
+            pfnPeStats = (PFN_vkGetPipelineExecutableStatisticsKHR)
+                vkGetDeviceProcAddr(device, "vkGetPipelineExecutableStatisticsKHR");
+            pfnPeIR = (PFN_vkGetPipelineExecutableInternalRepresentationsKHR)
+                vkGetDeviceProcAddr(device, "vkGetPipelineExecutableInternalRepresentationsKHR");
+        }
 
         VkPhysicalDeviceMemoryProperties memProps;
         vkGetPhysicalDeviceMemoryProperties(pd, &memProps);
@@ -555,6 +796,9 @@ static std::string runBenchmark(const std::string &shaderDir) {
             rep.line("---- %s*%s -> %s   shape %ux%ux%u ----",
                      componentTypeName(combo.inputType), componentTypeName(combo.inputType),
                      componentTypeName(combo.outputType), lM, lN, lK);
+
+            // Dump the compiled GPU ISA once per type (first pipeline built).
+            bool dumpedExec = false;
 
             // Load SPIR-V.
             std::string path = shaderDir + "/" + combo.spvFile;
@@ -733,6 +977,10 @@ static std::string runBenchmark(const std::string &shaderDir) {
                 VkComputePipelineCreateInfo cpci2 = { VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
                 cpci2.stage = ssci;
                 cpci2.layout = pipelineLayout;
+                // Ask the driver to keep statistics + ISA for this pipeline.
+                if (wantPipeExec && !dumpedExec)
+                    cpci2.flags |= VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR |
+                                   VK_PIPELINE_CREATE_CAPTURE_INTERNAL_REPRESENTATIONS_BIT_KHR;
                 VkPipeline pipeline;
                 VkResult pr = vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &cpci2, nullptr, &pipeline);
                 if (pr != VK_SUCCESS) {
@@ -740,6 +988,13 @@ static std::string runBenchmark(const std::string &shaderDir) {
                              localX, cRows, cCols, tileM, tileN, (int)pr);
                     freeBuf(bufA); freeBuf(bufB); freeBuf(bufC); freeBuf(bufD);
                     continue;
+                }
+
+                // Dump the compiled GPU ISA/statistics once per type combination.
+                if (wantPipeExec && !dumpedExec) {
+                    rep.line("  -- compiled GPU executable (ISA / statistics) --");
+                    dumpPipelineExecutables(device, pipeline, rep, pfnPeProps, pfnPeStats, pfnPeIR);
+                    dumpedExec = true;
                 }
 
                 uint32_t gx = N / tileN, gy = M / tileM;
