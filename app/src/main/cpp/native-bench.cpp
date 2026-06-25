@@ -1023,9 +1023,9 @@ static std::string runBenchmark(const std::string &shaderDir) {
                 }
 
                 uint32_t gx = N / tileN, gy = M / tileM;
-                // dim=1024 finishes too fast to time reliably, so run many more
-                // iterations there; larger dims already run long enough at 10.
-                const uint32_t repeats = (dim == 1024) ? 1000 : 10;
+                // Small problems finish too fast to time reliably: 1000 iters at
+                // 1024/2048, 100 elsewhere.
+                const uint32_t repeats = (dim == 1024 || dim == 2048) ? 1000 : 100;
 
                 // Record compute command buffer.
                 vkBeginCommandBuffer(cmd, &bi);
@@ -1050,7 +1050,7 @@ static std::string runBenchmark(const std::string &shaderDir) {
 
                 auto t0 = std::chrono::high_resolution_clock::now();
                 vkQueueSubmit(queue, 1, &si, VK_NULL_HANDLE);
-                vkQueueWaitIdle(queue);
+                VkResult waitRes = vkQueueWaitIdle(queue);
                 auto t1 = std::chrono::high_resolution_clock::now();
 
                 double sec = std::chrono::duration<double>(t1 - t0).count();
@@ -1073,15 +1073,27 @@ static std::string runBenchmark(const std::string &shaderDir) {
                 const char *opUnit   = combo.isFloat ? "GFLOP"  : "GOP";
                 const char *rateUnit = combo.isFloat ? "TFLOPS" : "TOPS";
 
+                double msIter = sec * 1e3 / repeats;
                 rep.line("  dim=%ux%ux%u tile=%ux%u (sg=%ux%u x%u, inv=%u, %u iters):",
                          M, N, K, tileM, tileN, wgW, wgH, reqSg, localX, repeats);
-                rep.line("      time    = %.3f ms (%.4f ms/iter)", sec * 1e3, sec * 1e3 / repeats);
+                rep.line("      time    = %.3f ms (%.4f ms/iter)", sec * 1e3, msIter);
                 rep.line("      compute = %.1f %s", ops / 1e9, opUnit);
                 rep.line("      load    = %.2f GB (buffer_load traffic, modeled)", loadBytes / 1e9);
                 rep.line("      => %.3f %s, %.1f GB/s", rate, rateUnit, bw);
+                if (waitRes != VK_SUCCESS)
+                    rep.line("      WARNING: vkQueueWaitIdle returned VkResult=%d "
+                             "(likely GPU job timeout / device-lost; result invalid)", (int)waitRes);
 
                 vkDestroyPipeline(device, pipeline, nullptr);
                 freeBuf(bufA); freeBuf(bufB); freeBuf(bufC); freeBuf(bufD);
+
+                // Once an iteration crosses 250 ms (or the device timed out), stop
+                // growing the problem for this config and move on to the next one.
+                if (msIter > 250.0 || waitRes != VK_SUCCESS) {
+                    rep.line("      (ms/iter %.1f exceeds 250 ms -> skipping larger dims for this config)",
+                             msIter);
+                    break;
+                }
                 } // dim sweep
             } // cfg
 
