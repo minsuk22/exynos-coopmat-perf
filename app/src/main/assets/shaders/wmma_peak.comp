@@ -1,19 +1,17 @@
 /*
- * WMMA peak-throughput microbenchmark.
+ * WMMA throughput microbenchmark with a tunable data-reuse ratio.
  *
- * Every subgroup loads ONE 16x16 A tile and ONE 16x16 B tile from a fixed shared
- * address (offset 0) -- all subgroups use the same data, and it stays resident
- * in registers/cache, so there is no DRAM streaming. It then hammers the matrix
- * (WMMA) unit with REPEATS iterations of NACC multiply-accumulates.
+ * Every subgroup works on a 16x16 A/B tile. With RELOADS_PER_10 = 0 the tile is
+ * loaded once and reused for all REPEATS iterations (100% reuse, compute bound,
+ * no DRAM streaming). As RELOADS_PER_10 grows, that many of every 10 iterations
+ * reload a FRESH tile from a large buffer (marching through BUF_TILES, per
+ * subgroup), injecting memory traffic. So reuse% = 100 - RELOADS_PER_10*10:
+ *   RELOADS_PER_10 = 0  -> 100% reuse (pure compute)
+ *   RELOADS_PER_10 = 5  ->  50% reuse
+ *   RELOADS_PER_10 = 10 ->   0% reuse (every MulAdd uses freshly loaded data)
  *
- * Folding guard: a naive "acc += matA*matB" loop with loop-invariant operands
- * has a closed form (acc = REPEATS * matA*matB) that the driver folds away,
- * producing bogus throughput. Here the NACC accumulators are CROSS-FED
- * (acc[i] uses acc[(i+1)%NACC]), making a coupled recurrence with no practical
- * closed form, so all REPEATS*NACC MulAdds actually execute. The accumulators
- * also give instruction-level parallelism to keep the unit fed.
- *
- * The result is meaningless (never verified); only throughput is measured.
+ * Folding guard: the NACC accumulators are cross-fed so the loop cannot be
+ * folded to a closed form. Result D is never verified; only throughput matters.
  *
  * Compile-time defines:
  *   A_TYPE = float16_t | int8_t | uint8_t | ...
@@ -33,6 +31,8 @@ layout(constant_id = 2) const uint lK = 16;
 layout(constant_id = 3) const uint REPEATS = 1024;
 layout(constant_id = 4) const uint NACC = 4;
 layout(local_size_x_id = 5, local_size_y = 1, local_size_z = 1) in;
+layout(constant_id = 6) const uint RELOADS_PER_10 = 0;   // 0..10 reloads per 10 iters
+layout(constant_id = 7) const uint BUF_TILES = 16384;    // tiles available for reload marching
 
 layout(set = 0, binding = 0) readonly  buffer BufA { A_TYPE a[]; };
 layout(set = 0, binding = 1) readonly  buffer BufB { A_TYPE b[]; };
@@ -41,28 +41,35 @@ layout(set = 0, binding = 3) writeonly buffer BufD { C_TYPE d[]; };
 
 void main()
 {
-    // One shared 16x16 tile for A and B (same address for every subgroup).
+    uint sg = gl_WorkGroupID.x * gl_NumSubgroups + gl_SubgroupID;
+    uint base = sg % BUF_TILES;
+    const uint TILE = lM * lK;   // = lK*lN = 256 for 16x16
+
     coopmat<A_TYPE, gl_ScopeSubgroup, lM, lK, gl_MatrixUseA> matA;
     coopmat<A_TYPE, gl_ScopeSubgroup, lK, lN, gl_MatrixUseB> matB;
-    coopMatLoad(matA, a, 0, lK, gl_CooperativeMatrixLayoutRowMajor);
-    coopMatLoad(matB, b, 0, lN, gl_CooperativeMatrixLayoutRowMajor);
+    coopMatLoad(matA, a, base * TILE, lK, gl_CooperativeMatrixLayoutRowMajor);
+    coopMatLoad(matB, b, base * TILE, lN, gl_CooperativeMatrixLayoutRowMajor);
 
     coopmat<C_TYPE, gl_ScopeSubgroup, lM, lN, gl_MatrixUseAccumulator> acc[8];
     [[unroll]] for (uint i = 0; i < NACC; ++i) {
         acc[i] = coopmat<C_TYPE, gl_ScopeSubgroup, lM, lN, gl_MatrixUseAccumulator>(C_TYPE(i + 1));
     }
 
-    // Pure WMMA throughput. Cross-feeding prevents the loop being folded.
+    uint loadIdx = 0;
     for (uint r = 0; r < REPEATS; ++r) {
+        // Reload a fresh tile on the first RELOADS_PER_10 of every 10 iterations.
+        if (RELOADS_PER_10 != 0u && (r % 10u) < RELOADS_PER_10) {
+            loadIdx++;
+            uint t = (base + loadIdx) % BUF_TILES;
+            coopMatLoad(matA, a, t * TILE, lK, gl_CooperativeMatrixLayoutRowMajor);
+            coopMatLoad(matB, b, t * TILE, lN, gl_CooperativeMatrixLayoutRowMajor);
+        }
         [[unroll]] for (uint i = 0; i < NACC; ++i) {
             acc[i] = coopMatMulAdd(matA, matB, acc[(i + 1u) % NACC]);
         }
     }
 
-    // Reduce and store so nothing is dead-code eliminated.
     coopmat<C_TYPE, gl_ScopeSubgroup, lM, lN, gl_MatrixUseAccumulator> sum = acc[0];
     [[unroll]] for (uint i = 1; i < NACC; ++i) sum = sum + acc[i];
-
-    uint sg = gl_WorkGroupID.x * gl_NumSubgroups + gl_SubgroupID;
     coopMatStore(sum, d, sg * (lM * lN), lN, gl_CooperativeMatrixLayoutRowMajor);
 }

@@ -1168,20 +1168,19 @@ static std::string runBenchmark(const std::string &shaderDir) {
             const uint32_t NACC = 4;
             const uint32_t SG_PER_WG = 4;
             const uint32_t repeatCounts[] = { 1024, 2048 };
-            const int ROUNDS = 10;   // measurements per (type, repeats), 1 s apart
+            const uint32_t BUF_TILES = 16384;   // 16x16 tiles available for reloads
             uint32_t localX = reqSg * SG_PER_WG;
-            // A single submission longer than the GPU watchdog makes
-            // vkQueueWaitIdle block forever. 8192 subgroups x 1024 repeats ran
-            // safely (~38 ms); 4x that hung. So keep subgroups x repeats per
-            // dispatch roughly constant at this budget by scaling the launch down
-            // as repeats grows.
+            // A submission longer than the GPU watchdog makes vkQueueWaitIdle
+            // block forever (~38 ms ran safely; 4x hung). Keep each dispatch near
+            // that budget, and divide it down further as reuse drops, since the
+            // extra memory loads make each iteration slower.
             const uint64_t WORK_BUDGET = (uint64_t)8192 * 1024;
             const uint32_t MAX_SUBGROUPS = 8192;   // D is sized for this
-            rep.line("config: subgroups/wg=%u, accumulators=%u, subgroupSize=%u",
-                     SG_PER_WG, NACC, reqSg);
-            rep.line("note: TFLOPS/TOPS count a multiply-add as 2 ops; the MAC-based");
-            rep.line("      figure (vendor-style) is half of it. subgroups scale down");
-            rep.line("      as repeats grows to keep each dispatch under the watchdog.");
+            rep.line("config: subgroups/wg=%u, accumulators=%u, subgroupSize=%u, reload buffer=%u tiles",
+                     SG_PER_WG, NACC, reqSg, BUF_TILES);
+            rep.line("note: reuse%% = 100 - reloads*10. 100%% = pure compute (no DRAM),");
+            rep.line("      0%% = every MulAdd reloads a fresh tile. TFLOPS/TOPS count a");
+            rep.line("      multiply-add as 2 ops; TMAC/s (vendor-style) is half.");
 
             auto makeBufP = [&](Buffer &b, VkDeviceSize bytes) -> bool {
                 b.size = bytes;
@@ -1246,10 +1245,11 @@ static std::string runBenchmark(const std::string &shaderDir) {
                 size_t inElem = componentBits(combo.inputType) / 8;
                 size_t outElem = componentBits(combo.outputType) / 8;
                 const VkDeviceSize tileElems = 16 * 16;
+                const VkDeviceSize abElems = (VkDeviceSize)BUF_TILES * tileElems;
 
                 Buffer bufA, bufB, bufC, bufD;
-                bool ok = makeBufP(bufA, tileElems * inElem) &&
-                          makeBufP(bufB, tileElems * inElem) &&
+                bool ok = makeBufP(bufA, abElems * inElem) &&
+                          makeBufP(bufB, abElems * inElem) &&
                           makeBufP(bufC, tileElems * outElem) &&
                           makeBufP(bufD, (VkDeviceSize)MAX_SUBGROUPS * tileElems * outElem);
                 if (!ok) {
@@ -1258,9 +1258,9 @@ static std::string runBenchmark(const std::string &shaderDir) {
                     vkDestroyShaderModule(device, module, nullptr); continue;
                 }
 
-                // Generate per-type input data. Small magnitudes so fp16 does not
-                // overflow; the value is irrelevant to throughput.
-                for (uint32_t i = 0; i < tileElems; ++i) {
+                // Generate per-type input data (all reload tiles). Small magnitudes
+                // so fp16 does not overflow; the value is irrelevant to throughput.
+                for (VkDeviceSize i = 0; i < abElems; ++i) {
                     if (combo.isFloat) {
                         ((uint16_t *)bufA.ptr)[i] = floatToHalf(0.01f);
                         ((uint16_t *)bufB.ptr)[i] = floatToHalf(0.01f);
@@ -1289,106 +1289,88 @@ static std::string runBenchmark(const std::string &shaderDir) {
                 bool dumpedExec = false;   // dump GPU ISA once per type
 
                 for (uint32_t repeats : repeatCounts) {
-                    // Scale the launch so subgroups*repeats ~= WORK_BUDGET, keeping
-                    // each dispatch short enough to avoid the watchdog hang.
-                    uint32_t workgroups = (uint32_t)(WORK_BUDGET / ((uint64_t)repeats * SG_PER_WG));
-                    if (workgroups < 64) workgroups = 64;
-                    if ((uint64_t)workgroups * SG_PER_WG > MAX_SUBGROUPS)
-                        workgroups = MAX_SUBGROUPS / SG_PER_WG;
-                    uint64_t totalSubgroups = (uint64_t)workgroups * SG_PER_WG;
+                    rep.line("  repeats=%u  --  data-reuse sweep (boost-warmed, best of 3):", repeats);
 
-                    uint32_t spec[6] = { 16, 16, 16, repeats, NACC, localX };
-                    VkSpecializationMapEntry ents[6];
-                    for (uint32_t i = 0; i < 6; ++i) ents[i] = { i, (uint32_t)(i * 4), 4 };
-                    VkSpecializationInfo spi = { 6, ents, sizeof(spec), spec };
+                    // Sweep reuse 100% -> 0% in 10% steps.
+                    for (int reuse = 100; reuse >= 0; reuse -= 10) {
+                        uint32_t reloadsPer10 = (uint32_t)((100 - reuse) / 10);
 
-                    VkPipelineShaderStageRequiredSubgroupSizeCreateInfo rss = {
-                        VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO };
-                    rss.requiredSubgroupSize = reqSg;
-                    VkPipelineShaderStageCreateInfo ssci = { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO };
-                    ssci.pNext = &rss;
-                    ssci.flags = VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT;
-                    ssci.stage = VK_SHADER_STAGE_COMPUTE_BIT;
-                    ssci.module = module; ssci.pName = "main"; ssci.pSpecializationInfo = &spi;
-                    VkComputePipelineCreateInfo cpci2 = { VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
-                    cpci2.stage = ssci; cpci2.layout = pipelineLayout;
-                    // Ask the driver to keep the compiled GPU executable so we can
-                    // dump its ISA (sp3) and statistics, once per type.
-                    if (wantPipeExec && !dumpedExec)
-                        cpci2.flags |= VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR |
-                                       VK_PIPELINE_CREATE_CAPTURE_INTERNAL_REPRESENTATIONS_BIT_KHR;
-                    VkPipeline pipeline;
-                    if (vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &cpci2, nullptr, &pipeline) != VK_SUCCESS) {
-                        rep.line("  repeats=%u: pipeline create failed", repeats); continue;
-                    }
-                    if (wantPipeExec && !dumpedExec) {
-                        rep.line("  -- compiled GPU executable (ISA / sp3, statistics) --");
-                        dumpPipelineExecutables(device, pipeline, rep, pfnPeProps, pfnPeStats, pfnPeIR);
-                        dumpedExec = true;
-                    }
+                        // Scale subgroups so the dispatch stays short; divide the
+                        // budget down as reuse drops (memory loads slow each iter).
+                        uint64_t budget = WORK_BUDGET / (1u + reloadsPer10);
+                        uint32_t workgroups = (uint32_t)(budget / ((uint64_t)repeats * SG_PER_WG));
+                        if (workgroups < 16) workgroups = 16;
+                        if ((uint64_t)workgroups * SG_PER_WG > MAX_SUBGROUPS)
+                            workgroups = MAX_SUBGROUPS / SG_PER_WG;
+                        uint64_t totalSubgroups = (uint64_t)workgroups * SG_PER_WG;
 
-                    VkCommandBufferBeginInfo bi = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
-                    vkBeginCommandBuffer(cmd, &bi);
-                    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayout, 0, 1, &descSet, 0, nullptr);
-                    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
-                    vkCmdDispatch(cmd, workgroups, 1, 1);
-                    vkEndCommandBuffer(cmd);
-                    VkSubmitInfo si = { VK_STRUCTURE_TYPE_SUBMIT_INFO };
-                    si.commandBufferCount = 1; si.pCommandBuffers = &cmd;
+                        uint32_t spec[8] = { 16, 16, 16, repeats, NACC, localX, reloadsPer10, BUF_TILES };
+                        VkSpecializationMapEntry ents[8];
+                        for (uint32_t i = 0; i < 8; ++i) ents[i] = { i, (uint32_t)(i * 4), 4 };
+                        VkSpecializationInfo spi = { 8, ents, sizeof(spec), spec };
 
-                    auto once = [&]() -> double {
-                        auto a = std::chrono::high_resolution_clock::now();
-                        vkQueueSubmit(queue, 1, &si, VK_NULL_HANDLE);
-                        VkResult wr = vkQueueWaitIdle(queue);
-                        auto b = std::chrono::high_resolution_clock::now();
-                        if (wr != VK_SUCCESS) return -1.0;
-                        return std::chrono::duration<double>(b - a).count();
-                    };
-                    double macs = 16.0 * 16.0 * 16.0 * (double)NACC * (double)repeats * (double)totalSubgroups;
-                    double ops = 2.0 * macs;
+                        VkPipelineShaderStageRequiredSubgroupSizeCreateInfo rss = {
+                            VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO };
+                        rss.requiredSubgroupSize = reqSg;
+                        VkPipelineShaderStageCreateInfo ssci = { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO };
+                        ssci.pNext = &rss;
+                        ssci.flags = VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT;
+                        ssci.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+                        ssci.module = module; ssci.pName = "main"; ssci.pSpecializationInfo = &spi;
+                        VkComputePipelineCreateInfo cpci2 = { VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
+                        cpci2.stage = ssci; cpci2.layout = pipelineLayout;
+                        // Capture the compiled GPU executable (ISA/sp3) once per type.
+                        if (wantPipeExec && !dumpedExec)
+                            cpci2.flags |= VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR |
+                                           VK_PIPELINE_CREATE_CAPTURE_INTERNAL_REPRESENTATIONS_BIT_KHR;
+                        VkPipeline pipeline;
+                        if (vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &cpci2, nullptr, &pipeline) != VK_SUCCESS) {
+                            rep.line("    reuse=%3d%%: pipeline create failed", reuse); continue;
+                        }
+                        if (wantPipeExec && !dumpedExec) {
+                            rep.line("  -- compiled GPU executable (ISA / sp3, statistics) --");
+                            dumpPipelineExecutables(device, pipeline, rep, pfnPeProps, pfnPeStats, pfnPeIR);
+                            dumpedExec = true;
+                        }
 
-                    // Run ROUNDS measurements, 1 s apart, printing each so the
-                    // performance over time (DVFS / thermal) is visible.
-                    rep.line("  repeats=%u (wg=%u, subgroups=%llu, compute=%.1f %s/run), "
-                             "%d rounds @ 1 s apart (boost-warmed):",
-                             repeats, workgroups, (unsigned long long)totalSubgroups,
-                             ops / 1e9, opUnit, ROUNDS);
-                    // Keep the GPU busy for ~burstSec to ramp it back to its boost
-                    // clock before each measured round (the 1 s idle between rounds
-                    // otherwise drops the clock and the short measured dispatch is
-                    // gone before the governor re-boosts).
-                    auto boostWarm = [&]() -> bool {
+                        VkCommandBufferBeginInfo bi = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+                        vkBeginCommandBuffer(cmd, &bi);
+                        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayout, 0, 1, &descSet, 0, nullptr);
+                        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
+                        vkCmdDispatch(cmd, workgroups, 1, 1);
+                        vkEndCommandBuffer(cmd);
+                        VkSubmitInfo si = { VK_STRUCTURE_TYPE_SUBMIT_INFO };
+                        si.commandBufferCount = 1; si.pCommandBuffers = &cmd;
+
+                        auto once = [&]() -> double {
+                            auto a = std::chrono::high_resolution_clock::now();
+                            vkQueueSubmit(queue, 1, &si, VK_NULL_HANDLE);
+                            VkResult wr = vkQueueWaitIdle(queue);
+                            auto b = std::chrono::high_resolution_clock::now();
+                            if (wr != VK_SUCCESS) return -1.0;
+                            return std::chrono::duration<double>(b - a).count();
+                        };
+                        double ops = 2.0 * 16.0 * 16.0 * 16.0 * (double)NACC * (double)repeats * (double)totalSubgroups;
+
+                        // Boost warmup (~300 ms) so the measurement is at peak clock.
+                        bool lost = false;
                         double warm = 0.0;
-                        while (warm < 0.3) {           // ~300 ms of work
-                            double s = once();
-                            if (s < 0) return false;   // device-lost
-                            warm += s;
-                        }
-                        return true;
-                    };
-                    for (int rnd = 0; rnd < ROUNDS; ++rnd) {
-                        if (!boostWarm()) {
-                            rep.line("    round %2d: device-lost (VkResult=-4)", rnd + 1);
-                            break;
-                        }
-                        // Best of 3 timed runs, all at the boosted clock.
-                        double best = 1e30; bool lost = false;
-                        for (int t = 0; t < 3; ++t) {
+                        while (warm < 0.3) { double s = once(); if (s < 0) { lost = true; break; } warm += s; }
+                        double best = 1e30;
+                        if (!lost) for (int t = 0; t < 3; ++t) {
                             double s = once();
                             if (s < 0) { lost = true; break; }
                             if (s < best) best = s;
                         }
-                        if (lost) {
-                            rep.line("    round %2d: device-lost (VkResult=-4)", rnd + 1);
-                            break;
-                        }
+                        vkDestroyPipeline(device, pipeline, nullptr);
+                        if (lost) { rep.line("    reuse=%3d%%: device-lost (VkResult=-4)", reuse); continue; }
+
                         double rate = ops / best / 1e12;   // TFLOPS/TOPS (2-op)
-                        rep.line("    round %2d: time=%.3f ms | %.2f %s (2-op) = %.2f TMAC/s",
-                                 rnd + 1, best * 1e3, rate, rateUnit, rate / 2.0);
-                        if (rnd + 1 < ROUNDS)
-                            std::this_thread::sleep_for(std::chrono::seconds(1));
+                        rep.line("    reuse=%3d%% (reloads=%u/10, wg=%u, sg=%llu): "
+                                 "time=%.3f ms | %.2f %s (2-op) = %.2f TMAC/s",
+                                 reuse, reloadsPer10, workgroups, (unsigned long long)totalSubgroups,
+                                 best * 1e3, rate, rateUnit, rate / 2.0);
                     }
-                    vkDestroyPipeline(device, pipeline, nullptr);
                 }
 
                 freeBufP(bufA); freeBufP(bufB); freeBufP(bufC); freeBufP(bufD);
