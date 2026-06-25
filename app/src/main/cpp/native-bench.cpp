@@ -1378,6 +1378,199 @@ static std::string runBenchmark(const std::string &shaderDir) {
             }
         }
 
+        // ===================== 1024x1024x1024 matmul (WMMA GEMM) =====================
+        // Real C = A*B at M=N=K=1024 using the cooperative-matrix GEMM shader, for
+        // fp16 and int8. Device-local buffers; one matmul is tiny (~2.1 GFLOP) so
+        // each timed run dispatches R back-to-back (R calibrated to ~40 ms) and the
+        // throughput is the best of 3 boost-warmed runs across a small tile sweep.
+        {
+            rep.line("");
+            rep.line("==== 1024x1024x1024 matmul (WMMA GEMM) ====");
+            const uint32_t MM = 1024, NN = 1024, KK = 1024;
+            const uint32_t lM = 16, lN = 16, lK = 16;
+
+            auto makeBufDL = [&](Buffer &b, VkDeviceSize bytes) -> bool {
+                b.size = bytes;
+                VkBufferCreateInfo bci = { VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
+                bci.size = bytes;
+                bci.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                            VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+                bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+                if (vkCreateBuffer(device, &bci, nullptr, &b.host) != VK_SUCCESS) return false;
+                if (vkCreateBuffer(device, &bci, nullptr, &b.dev) != VK_SUCCESS) return false;
+                VkMemoryRequirements mr; vkGetBufferMemoryRequirements(device, b.host, &mr);
+                int32_t hi = findMemoryType(memProps, mr.memoryTypeBits,
+                    VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+                int32_t di = findMemoryType(memProps, mr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+                if (di < 0) di = hi;
+                if (hi < 0) return false;
+                VkMemoryAllocateInfo mai = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
+                mai.allocationSize = mr.size; mai.memoryTypeIndex = (uint32_t)hi;
+                if (vkAllocateMemory(device, &mai, nullptr, &b.hostMem) != VK_SUCCESS) return false;
+                mai.memoryTypeIndex = (uint32_t)di;
+                if (vkAllocateMemory(device, &mai, nullptr, &b.devMem) != VK_SUCCESS) return false;
+                vkBindBufferMemory(device, b.host, b.hostMem, 0);
+                vkBindBufferMemory(device, b.dev, b.devMem, 0);
+                vkMapMemory(device, b.hostMem, 0, bytes, 0, &b.ptr);
+                return true;
+            };
+            auto freeBufDL = [&](Buffer &b) {
+                if (b.host) vkDestroyBuffer(device, b.host, nullptr);
+                if (b.dev) vkDestroyBuffer(device, b.dev, nullptr);
+                if (b.hostMem) vkFreeMemory(device, b.hostMem, nullptr);
+                if (b.devMem) vkFreeMemory(device, b.devMem, nullptr);
+                b = Buffer{};
+            };
+
+            for (const auto &combo : kCombos) {
+                if (combo.isFloat && !canFloat) continue;
+                if (!combo.isFloat && !canInt) continue;
+                bool have16 = false;
+                for (const auto &c : coop)
+                    if (c.scope == VK_SCOPE_SUBGROUP_KHR && c.MSize == 16 && c.NSize == 16 && c.KSize == 16 &&
+                        c.AType == combo.inputType && c.BType == combo.inputType &&
+                        c.CType == combo.outputType && c.ResultType == combo.outputType) { have16 = true; break; }
+
+                rep.line("");
+                rep.line("---- %s*%s -> %s [matmul 1024^3] ----",
+                         componentTypeName(combo.inputType), componentTypeName(combo.inputType),
+                         componentTypeName(combo.outputType));
+                if (!have16) { rep.line("  no 16x16x16 subgroup shape; skip"); continue; }
+
+                std::string path = shaderDir + "/" + combo.spvFile;
+                std::ifstream f(path, std::ios::binary | std::ios::ate);
+                if (!f) { rep.line("  shader not found: %s", path.c_str()); continue; }
+                std::streamsize sz = f.tellg(); f.seekg(0);
+                std::vector<char> spv(sz); f.read(spv.data(), sz);
+                VkShaderModuleCreateInfo smci = { VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO };
+                smci.codeSize = (size_t)sz; smci.pCode = (const uint32_t *)spv.data();
+                VkShaderModule module;
+                if (vkCreateShaderModule(device, &smci, nullptr, &module) != VK_SUCCESS) {
+                    rep.line("  module create failed"); continue;
+                }
+
+                size_t inElem = componentBits(combo.inputType) / 8;
+                size_t outElem = componentBits(combo.outputType) / 8;
+                const char *rateUnit = combo.isFloat ? "TFLOPS" : "TOPS";
+
+                struct Cfg { uint32_t inv, cR, cC; };
+                const Cfg cfgs[] = { { 256, 2, 2 }, { 256, 4, 2 }, { 128, 2, 2 } };
+                double bestRate = 0.0, bestMs = 0.0; uint32_t bTileM = 0, bTileN = 0;
+
+                for (const auto &cfg : cfgs) {
+                    uint32_t numSg = std::max(1u, cfg.inv / reqSg);
+                    uint32_t wgW = numSg, wgH = 1;
+                    for (uint32_t h = (uint32_t)std::floor(std::sqrt((double)numSg)); h >= 1; --h)
+                        if (numSg % h == 0) { wgH = h; wgW = numSg / h; break; }
+                    uint32_t cR = cfg.cR, cC = cfg.cC;
+                    uint32_t tileM = wgH * cR * lM, tileN = wgW * cC * lN, localX = wgW * wgH * reqSg;
+                    auto rup = [](uint32_t v, uint32_t a) { return (v + a - 1) / a * a; };
+                    uint32_t M = rup(MM, tileM), N = rup(NN, tileN), K = rup(KK, lK);
+
+                    Buffer bA, bB, bC, bD;
+                    bool ok = makeBufDL(bA, (VkDeviceSize)M * K * inElem) &&
+                              makeBufDL(bB, (VkDeviceSize)K * N * inElem) &&
+                              makeBufDL(bC, (VkDeviceSize)M * N * outElem) &&
+                              makeBufDL(bD, (VkDeviceSize)M * N * outElem);
+                    if (!ok) { rep.line("  cfg alloc failed"); freeBufDL(bA); freeBufDL(bB); freeBufDL(bC); freeBufDL(bD); continue; }
+
+                    auto fill = [&](Buffer &b, VkDeviceSize cnt) {
+                        for (VkDeviceSize i = 0; i < cnt; ++i) {
+                            if (combo.isFloat) ((uint16_t *)b.ptr)[i] = floatToHalf(0.01f);
+                            else ((int8_t *)b.ptr)[i] = 1;
+                        }
+                    };
+                    fill(bA, (VkDeviceSize)M * K); fill(bB, (VkDeviceSize)K * N);
+                    memset(bC.ptr, 0, (size_t)bC.size); memset(bD.ptr, 0, (size_t)bD.size);
+
+                    VkCommandBufferBeginInfo bi = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+                    VkSubmitInfo si = { VK_STRUCTURE_TYPE_SUBMIT_INFO };
+                    si.commandBufferCount = 1; si.pCommandBuffers = &cmd;
+
+                    vkBeginCommandBuffer(cmd, &bi);
+                    for (Buffer *bp : { &bA, &bB, &bC, &bD }) { VkBufferCopy cp = { 0, 0, bp->size }; vkCmdCopyBuffer(cmd, bp->host, bp->dev, 1, &cp); }
+                    vkEndCommandBuffer(cmd);
+                    vkQueueSubmit(queue, 1, &si, VK_NULL_HANDLE); vkQueueWaitIdle(queue);
+
+                    VkDescriptorBufferInfo dbi[4] = { { bA.dev, 0, VK_WHOLE_SIZE }, { bB.dev, 0, VK_WHOLE_SIZE },
+                                                      { bC.dev, 0, VK_WHOLE_SIZE }, { bD.dev, 0, VK_WHOLE_SIZE } };
+                    VkWriteDescriptorSet wds[4];
+                    for (int i = 0; i < 4; ++i) {
+                        wds[i] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
+                        wds[i].dstSet = descSet; wds[i].dstBinding = (uint32_t)i; wds[i].descriptorCount = 1;
+                        wds[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; wds[i].pBufferInfo = &dbi[i];
+                    }
+                    vkUpdateDescriptorSets(device, 4, wds, 0, nullptr);
+
+                    float alpha = 1.0f, beta = 0.0f;
+                    uint32_t spec[13];
+                    spec[0] = lM; spec[1] = lN; spec[2] = lK; spec[3] = M; spec[4] = N; spec[5] = K;
+                    spec[6] = cR; spec[7] = cC; spec[8] = wgW; spec[9] = wgH;
+                    memcpy(&spec[10], &alpha, 4); memcpy(&spec[11], &beta, 4); spec[12] = localX;
+                    VkSpecializationMapEntry ents[13];
+                    for (uint32_t i = 0; i < 13; ++i) ents[i] = { i, (uint32_t)(i * 4), 4 };
+                    VkSpecializationInfo spi = { 13, ents, sizeof(spec), spec };
+                    VkPipelineShaderStageRequiredSubgroupSizeCreateInfo rss = {
+                        VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO };
+                    rss.requiredSubgroupSize = reqSg;
+                    VkPipelineShaderStageCreateInfo ssci = { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO };
+                    ssci.pNext = &rss; ssci.flags = VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT;
+                    ssci.stage = VK_SHADER_STAGE_COMPUTE_BIT; ssci.module = module; ssci.pName = "main";
+                    ssci.pSpecializationInfo = &spi;
+                    VkComputePipelineCreateInfo cpci2 = { VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
+                    cpci2.stage = ssci; cpci2.layout = pipelineLayout;
+                    VkPipeline pipeline;
+                    if (vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &cpci2, nullptr, &pipeline) != VK_SUCCESS) {
+                        rep.line("  cfg pipeline create failed"); freeBufDL(bA); freeBufDL(bB); freeBufDL(bC); freeBufDL(bD); continue;
+                    }
+
+                    uint32_t gx = N / tileN, gy = M / tileM;
+                    VkResult wr = VK_SUCCESS;
+                    auto recordR = [&](uint32_t R) {
+                        vkBeginCommandBuffer(cmd, &bi);
+                        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayout, 0, 1, &descSet, 0, nullptr);
+                        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
+                        for (uint32_t i = 0; i < R; ++i) vkCmdDispatch(cmd, gx, gy, 1);
+                        vkEndCommandBuffer(cmd);
+                    };
+                    auto timed = [&]() -> double {
+                        auto a = std::chrono::high_resolution_clock::now();
+                        vkQueueSubmit(queue, 1, &si, VK_NULL_HANDLE);
+                        wr = vkQueueWaitIdle(queue);
+                        auto b = std::chrono::high_resolution_clock::now();
+                        if (wr != VK_SUCCESS) return -1.0;
+                        return std::chrono::duration<double>(b - a).count();
+                    };
+
+                    // Calibrate R so one timed submit is ~40 ms (watchdog-safe).
+                    recordR(1); timed(); double t1 = timed();
+                    if (t1 < 0) { rep.line("  cfg device-lost"); vkDestroyPipeline(device, pipeline, nullptr); freeBufDL(bA); freeBufDL(bB); freeBufDL(bC); freeBufDL(bD); continue; }
+                    uint32_t R = (uint32_t)std::max(1.0, 0.04 / t1); if (R > 4000) R = 4000;
+                    recordR(R);
+                    double w = 0.0; bool lost = false;       // boost warmup ~200 ms
+                    while (w < 0.2) { double s = timed(); if (s < 0) { lost = true; break; } w += s; }
+                    double best = 1e30;
+                    if (!lost) for (int t = 0; t < 3; ++t) { double s = timed(); if (s < 0) { lost = true; break; } if (s < best) best = s; }
+                    vkDestroyPipeline(device, pipeline, nullptr);
+
+                    if (!lost) {
+                        double ops = 2.0 * (double)M * (double)N * (double)K * (double)R;
+                        double rate = ops / best / 1e12;
+                        double msPerMatmul = best * 1e3 / R;
+                        rep.line("  tile %ux%u (R=%u, dim=%ux%ux%u): %.4f ms/matmul | %.2f %s = %.2f TMAC/s",
+                                 tileM, tileN, R, M, N, K, msPerMatmul, rate, rateUnit, rate / 2.0);
+                        if (rate > bestRate) { bestRate = rate; bestMs = msPerMatmul; bTileM = tileM; bTileN = tileN; }
+                    } else rep.line("  cfg device-lost mid-measurement");
+
+                    freeBufDL(bA); freeBufDL(bB); freeBufDL(bC); freeBufDL(bD);
+                }
+                vkDestroyShaderModule(device, module, nullptr);
+                if (bestRate > 0.0)
+                    rep.line("  BEST: tile %ux%u  %.4f ms/matmul | %.2f %s = %.2f TMAC/s",
+                             bTileM, bTileN, bestMs, bestRate, rateUnit, bestRate / 2.0);
+            }
+        }
+
         vkDestroyCommandPool(device, cmdPool, nullptr);
         vkDestroyDescriptorPool(device, descPool, nullptr);
         vkDestroyPipelineLayout(device, pipelineLayout, nullptr);
