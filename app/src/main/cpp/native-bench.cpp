@@ -334,6 +334,47 @@ struct Buffer {
 // internal representations (the GPU ISA / disassembly text), when the driver
 // chooses to expose them. Quietly degrades to whatever the driver provides.
 // ---------------------------------------------------------------------------
+// Print only the per-pipeline statistics (register usage, etc.), one line per
+// stat, prefixed with `tag`. Lighter than dumpPipelineExecutables (no ISA text).
+// ---------------------------------------------------------------------------
+static void dumpPipelineStatsOnly(
+    VkDevice device, VkPipeline pipeline, Report &rep, const char *tag,
+    PFN_vkGetPipelineExecutablePropertiesKHR pProps,
+    PFN_vkGetPipelineExecutableStatisticsKHR pStats) {
+    if (!pProps || !pStats) return;
+    VkPipelineInfoKHR pi = { VK_STRUCTURE_TYPE_PIPELINE_INFO_KHR };
+    pi.pipeline = pipeline;
+    uint32_t numExec = 0;
+    if (pProps(device, &pi, &numExec, nullptr) != VK_SUCCESS || numExec == 0) return;
+    std::vector<VkPipelineExecutablePropertiesKHR> props(numExec);
+    for (auto &p : props) { p = {}; p.sType = VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_PROPERTIES_KHR; }
+    pProps(device, &pi, &numExec, props.data());
+    for (uint32_t e = 0; e < numExec; ++e) {
+        VkPipelineExecutableInfoKHR ei = { VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_INFO_KHR };
+        ei.pipeline = pipeline; ei.executableIndex = e;
+        uint32_t n = 0;
+        pStats(device, &ei, &n, nullptr);
+        if (!n) { rep.line("    %s: (no statistics exposed by driver)", tag); continue; }
+        std::vector<VkPipelineExecutableStatisticKHR> st(n);
+        for (auto &s : st) { s = {}; s.sType = VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_STATISTIC_KHR; }
+        pStats(device, &ei, &n, st.data());
+        for (const auto &s : st) {
+            switch (s.format) {
+            case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_BOOL32_KHR:
+                rep.line("    %s: %-30s = %s", tag, s.name, s.value.b32 ? "true" : "false"); break;
+            case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_INT64_KHR:
+                rep.line("    %s: %-30s = %lld", tag, s.name, (long long)s.value.i64); break;
+            case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_UINT64_KHR:
+                rep.line("    %s: %-30s = %llu", tag, s.name, (unsigned long long)s.value.u64); break;
+            case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_FLOAT64_KHR:
+                rep.line("    %s: %-30s = %f", tag, s.name, s.value.f64); break;
+            default: break;
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 static void dumpPipelineExecutables(
     VkDevice device, VkPipeline pipeline, Report &rep,
     PFN_vkGetPipelineExecutablePropertiesKHR pProps,
@@ -1561,10 +1602,14 @@ static std::string runBenchmark(const std::string &shaderDir) {
                     ssci.pSpecializationInfo = &spi;
                     VkComputePipelineCreateInfo cpci2 = { VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
                     cpci2.stage = ssci; cpci2.layout = pipelineLayout;
+                    if (wantPipeExec) cpci2.flags |= VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR;
                     VkPipeline pipeline;
                     if (vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &cpci2, nullptr, &pipeline) != VK_SUCCESS) {
                         rep.line("  cfg pipeline create failed"); freeBufDL(bA); freeBufDL(bB); freeBufDL(bC); freeBufDL(bD); continue;
                     }
+                    // Per-config pipeline statistics (VGPR/SGPR usage, etc.).
+                    if (wantPipeExec)
+                        dumpPipelineStatsOnly(device, pipeline, rep, "stat", pfnPeProps, pfnPeStats);
 
                     uint32_t gx = N / tileN, gy = M / tileM;
                     VkResult wr = VK_SUCCESS;
