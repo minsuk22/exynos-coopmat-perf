@@ -866,10 +866,12 @@ static std::string runBenchmark(const std::string &shaderDir) {
                 uint32_t tileN = wgW * cCols * lN;
                 uint32_t localX = wgW * wgH * reqSg;
 
-                // Sweep the problem size from 1024 to 8192 in steps of 1024
-                // (each dim rounded up to tile / lK multiples).
+                // Sweep the problem size: 256, 512, then 1024..8192 in steps of
+                // 1024 (each dim rounded up to tile / lK multiples).
                 auto roundUp = [](uint32_t v, uint32_t a) { return (v + a - 1) / a * a; };
-                for (uint32_t dim = 1024; dim <= 8192; dim += 1024) {
+                std::vector<uint32_t> dims = { 256, 512 };
+                for (uint32_t d = 1024; d <= 8192; d += 1024) dims.push_back(d);
+                for (uint32_t dim : dims) {
                 uint32_t M = roundUp(dim, tileM);
                 uint32_t N = roundUp(dim, tileN);
                 uint32_t K = roundUp(dim, lK);
@@ -1097,7 +1099,7 @@ static std::string runBenchmark(const std::string &shaderDir) {
 
                 // (3) Run the requested iterations in batches that each stay
                 // ~<=200 ms (well under the watchdog), up to a ~3 s wall budget.
-                uint32_t targetIters = (dim == 1024 || dim == 2048) ? 1000 : 100;
+                uint32_t targetIters = (dim <= 2048) ? 1000 : 100;
                 uint32_t batch = (oneMs > 0.001) ? (uint32_t)(200.0 / oneMs) : targetIters;
                 if (batch < 1) batch = 1;
                 if (batch > targetIters) batch = targetIters;
