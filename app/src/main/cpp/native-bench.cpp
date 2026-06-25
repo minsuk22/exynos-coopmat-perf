@@ -296,15 +296,16 @@ static float halfToFloat(uint16_t h) {
 struct TypeCombo {
     VkComponentTypeKHR inputType;
     VkComponentTypeKHR outputType;
-    const char *spvFile;
+    const char *spvFile;       // GEMM sweep shader (currently disabled)
+    const char *peakSpvFile;   // WMMA peak microbenchmark shader
     bool isFloat;
 };
 
 static const TypeCombo kCombos[] = {
-    { VK_COMPONENT_TYPE_FLOAT16_KHR, VK_COMPONENT_TYPE_FLOAT32_KHR, "gemm_fp16_fp32.spv", true },
-    { VK_COMPONENT_TYPE_FLOAT16_KHR, VK_COMPONENT_TYPE_FLOAT16_KHR, "gemm_fp16_fp16.spv", true },
-    { VK_COMPONENT_TYPE_SINT8_KHR,   VK_COMPONENT_TYPE_SINT32_KHR,  "gemm_s8_s32.spv",   false },
-    { VK_COMPONENT_TYPE_UINT8_KHR,   VK_COMPONENT_TYPE_UINT32_KHR,  "gemm_u8_u32.spv",   false },
+    { VK_COMPONENT_TYPE_FLOAT16_KHR, VK_COMPONENT_TYPE_FLOAT32_KHR, "gemm_fp16_fp32.spv", "wmma_peak_fp16_fp32.spv", true },
+    { VK_COMPONENT_TYPE_FLOAT16_KHR, VK_COMPONENT_TYPE_FLOAT16_KHR, "gemm_fp16_fp16.spv", "wmma_peak_fp16_fp16.spv", true },
+    { VK_COMPONENT_TYPE_SINT8_KHR,   VK_COMPONENT_TYPE_SINT32_KHR,  "gemm_s8_s32.spv",   "wmma_peak_s8_s32.spv",   false },
+    { VK_COMPONENT_TYPE_UINT8_KHR,   VK_COMPONENT_TYPE_UINT32_KHR,  "gemm_u8_u32.spv",   "wmma_peak_u8_u32.spv",   false },
 };
 
 static int32_t findMemoryType(const VkPhysicalDeviceMemoryProperties &mp,
@@ -422,8 +423,8 @@ static void dumpPipelineExecutables(
 // Print the GLSL shader source (bundled alongside the SPIR-V) into the report,
 // so the report shows exactly what shader was compiled and run.
 // ---------------------------------------------------------------------------
-static void dumpShaderSource(const std::string &shaderDir, Report &rep) {
-    std::string path = shaderDir + "/gemm_coopmat.comp";
+static void dumpOneShaderSource(const std::string &shaderDir, const char *name, Report &rep) {
+    std::string path = shaderDir + "/" + name;
     std::ifstream f(path, std::ios::binary | std::ios::ate);
     rep.line("");
     if (!f) {
@@ -434,11 +435,15 @@ static void dumpShaderSource(const std::string &shaderDir, Report &rep) {
     f.seekg(0);
     std::string src((size_t)(sz > 0 ? sz : 0), '\0');
     if (sz > 0) f.read(&src[0], sz);
-    rep.line("==== Shader source: gemm_coopmat.comp (%ld bytes) ====", (long)sz);
-    rep.line("(generic GEMM; specialized per type via -DA_TYPE / -DC_TYPE at compile time)");
+    rep.line("==== Shader source: %s (%ld bytes) ====", name, (long)sz);
     rep.raw(src);
     if (src.empty() || src.back() != '\n') rep.raw("\n");
-    rep.line("==== end shader source ====");
+    rep.line("==== end %s ====", name);
+}
+
+static void dumpShaderSource(const std::string &shaderDir, Report &rep) {
+    // The active test is the WMMA peak microbenchmark; print its source.
+    dumpOneShaderSource(shaderDir, "wmma_peak.comp", rep);
 }
 
 // ---------------------------------------------------------------------------
@@ -810,6 +815,7 @@ static std::string runBenchmark(const std::string &shaderDir) {
         VkCommandBuffer cmd;
         vkAllocateCommandBuffers(device, &cbai, &cmd);
 
+#if 0   // ===== GEMM dimension-sweep benchmark: DISABLED (WMMA peak test runs instead) =====
         // -------- run each plan --------
         for (const auto &pl : plans) {
             const TypeCombo &combo = *pl.combo;
@@ -1128,6 +1134,187 @@ static std::string runBenchmark(const std::string &shaderDir) {
 
             vkDestroyShaderModule(device, module, nullptr);
         } // plans
+#endif  // ===== end disabled GEMM dimension-sweep benchmark =====
+
+        // ======================= WMMA peak-throughput test =======================
+        // Goal: the matrix engine's peak compute, isolated from DRAM. Every
+        // subgroup loads one shared 16x16 A/B tile (cache/register resident) and
+        // repeats NACC cross-fed MulAdds REPEATS times, for REPEATS in
+        // {1024, 4096, 8196}. Data is generated per operation type.
+        {
+            rep.line("");
+            rep.line("==== WMMA peak throughput (16x16 tile loaded once, repeated MulAdd) ====");
+
+            const uint32_t NACC = 4;
+            const uint32_t SG_PER_WG = 4;
+            const uint32_t WORKGROUPS = 2048;
+            const uint32_t repeatCounts[] = { 1024, 4096, 8196 };
+            uint32_t localX = reqSg * SG_PER_WG;
+            uint64_t totalSubgroups = (uint64_t)WORKGROUPS * SG_PER_WG;
+            rep.line("config: workgroups=%u, subgroups/wg=%u, total subgroups=%llu, "
+                     "accumulators=%u, subgroupSize=%u",
+                     WORKGROUPS, SG_PER_WG, (unsigned long long)totalSubgroups, NACC, reqSg);
+            rep.line("note: TFLOPS/TOPS count a multiply-add as 2 ops; the MAC-based");
+            rep.line("      figure (vendor-style) is half of it.");
+
+            auto makeBufP = [&](Buffer &b, VkDeviceSize bytes) -> bool {
+                b.size = bytes;
+                VkBufferCreateInfo bci = { VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
+                bci.size = bytes;
+                bci.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+                bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+                if (vkCreateBuffer(device, &bci, nullptr, &b.dev) != VK_SUCCESS) return false;
+                VkMemoryRequirements mr; vkGetBufferMemoryRequirements(device, b.dev, &mr);
+                int32_t mi = findMemoryType(memProps, mr.memoryTypeBits,
+                    VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+                if (mi < 0) return false;
+                VkMemoryAllocateInfo mai = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
+                mai.allocationSize = mr.size; mai.memoryTypeIndex = (uint32_t)mi;
+                if (vkAllocateMemory(device, &mai, nullptr, &b.devMem) != VK_SUCCESS) return false;
+                vkBindBufferMemory(device, b.dev, b.devMem, 0);
+                vkMapMemory(device, b.devMem, 0, bytes, 0, &b.ptr);
+                return true;
+            };
+            auto freeBufP = [&](Buffer &b) {
+                if (b.dev) vkDestroyBuffer(device, b.dev, nullptr);
+                if (b.devMem) vkFreeMemory(device, b.devMem, nullptr);
+                b = Buffer{};
+            };
+
+            for (const auto &combo : kCombos) {
+                if (combo.isFloat && !canFloat) continue;
+                if (!combo.isFloat && !canInt) continue;
+
+                bool have16 = false;
+                for (const auto &c : coop)
+                    if (c.scope == VK_SCOPE_SUBGROUP_KHR &&
+                        c.MSize == 16 && c.NSize == 16 && c.KSize == 16 &&
+                        c.AType == combo.inputType && c.BType == combo.inputType &&
+                        c.CType == combo.outputType && c.ResultType == combo.outputType) {
+                        have16 = true; break;
+                    }
+
+                rep.line("");
+                rep.line("---- %s*%s -> %s [WMMA peak, 16x16x16] ----",
+                         componentTypeName(combo.inputType), componentTypeName(combo.inputType),
+                         componentTypeName(combo.outputType));
+                if (!have16) { rep.line("  no 16x16x16 subgroup shape advertised; skip"); continue; }
+
+                std::string path = shaderDir + "/" + combo.peakSpvFile;
+                std::ifstream f(path, std::ios::binary | std::ios::ate);
+                if (!f) { rep.line("  SKIP: shader not found: %s", path.c_str()); continue; }
+                std::streamsize sz = f.tellg(); f.seekg(0);
+                std::vector<char> spv(sz); f.read(spv.data(), sz);
+                VkShaderModuleCreateInfo smci = { VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO };
+                smci.codeSize = (size_t)sz; smci.pCode = (const uint32_t *)spv.data();
+                VkShaderModule module;
+                if (vkCreateShaderModule(device, &smci, nullptr, &module) != VK_SUCCESS) {
+                    rep.line("  SKIP: shader module create failed"); continue;
+                }
+
+                size_t inElem = componentBits(combo.inputType) / 8;
+                size_t outElem = componentBits(combo.outputType) / 8;
+                const VkDeviceSize tileElems = 16 * 16;
+
+                Buffer bufA, bufB, bufC, bufD;
+                bool ok = makeBufP(bufA, tileElems * inElem) &&
+                          makeBufP(bufB, tileElems * inElem) &&
+                          makeBufP(bufC, tileElems * outElem) &&
+                          makeBufP(bufD, (VkDeviceSize)totalSubgroups * tileElems * outElem);
+                if (!ok) {
+                    rep.line("  buffer alloc failed; skip");
+                    freeBufP(bufA); freeBufP(bufB); freeBufP(bufC); freeBufP(bufD);
+                    vkDestroyShaderModule(device, module, nullptr); continue;
+                }
+
+                // Generate per-type input data. Small magnitudes so fp16 does not
+                // overflow; the value is irrelevant to throughput.
+                for (uint32_t i = 0; i < tileElems; ++i) {
+                    if (combo.isFloat) {
+                        ((uint16_t *)bufA.ptr)[i] = floatToHalf(0.01f);
+                        ((uint16_t *)bufB.ptr)[i] = floatToHalf(0.01f);
+                    } else {
+                        ((int8_t *)bufA.ptr)[i] = 1;
+                        ((int8_t *)bufB.ptr)[i] = 1;
+                    }
+                }
+                memset(bufC.ptr, 0, (size_t)bufC.size);
+
+                VkDescriptorBufferInfo dbi[4] = {
+                    { bufA.dev, 0, VK_WHOLE_SIZE }, { bufB.dev, 0, VK_WHOLE_SIZE },
+                    { bufC.dev, 0, VK_WHOLE_SIZE }, { bufD.dev, 0, VK_WHOLE_SIZE } };
+                VkWriteDescriptorSet wds[4];
+                for (int i = 0; i < 4; ++i) {
+                    wds[i] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
+                    wds[i].dstSet = descSet; wds[i].dstBinding = (uint32_t)i;
+                    wds[i].descriptorCount = 1;
+                    wds[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+                    wds[i].pBufferInfo = &dbi[i];
+                }
+                vkUpdateDescriptorSets(device, 4, wds, 0, nullptr);
+
+                const char *opUnit   = combo.isFloat ? "GFLOP"  : "GOP";
+                const char *rateUnit = combo.isFloat ? "TFLOPS" : "TOPS";
+
+                for (uint32_t repeats : repeatCounts) {
+                    uint32_t spec[6] = { 16, 16, 16, repeats, NACC, localX };
+                    VkSpecializationMapEntry ents[6];
+                    for (uint32_t i = 0; i < 6; ++i) ents[i] = { i, (uint32_t)(i * 4), 4 };
+                    VkSpecializationInfo spi = { 6, ents, sizeof(spec), spec };
+
+                    VkPipelineShaderStageRequiredSubgroupSizeCreateInfo rss = {
+                        VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO };
+                    rss.requiredSubgroupSize = reqSg;
+                    VkPipelineShaderStageCreateInfo ssci = { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO };
+                    ssci.pNext = &rss;
+                    ssci.flags = VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT;
+                    ssci.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+                    ssci.module = module; ssci.pName = "main"; ssci.pSpecializationInfo = &spi;
+                    VkComputePipelineCreateInfo cpci2 = { VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
+                    cpci2.stage = ssci; cpci2.layout = pipelineLayout;
+                    VkPipeline pipeline;
+                    if (vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &cpci2, nullptr, &pipeline) != VK_SUCCESS) {
+                        rep.line("  repeats=%u: pipeline create failed", repeats); continue;
+                    }
+
+                    VkCommandBufferBeginInfo bi = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+                    vkBeginCommandBuffer(cmd, &bi);
+                    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayout, 0, 1, &descSet, 0, nullptr);
+                    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
+                    vkCmdDispatch(cmd, WORKGROUPS, 1, 1);
+                    vkEndCommandBuffer(cmd);
+                    VkSubmitInfo si = { VK_STRUCTURE_TYPE_SUBMIT_INFO };
+                    si.commandBufferCount = 1; si.pCommandBuffers = &cmd;
+
+                    auto once = [&]() -> double {
+                        auto a = std::chrono::high_resolution_clock::now();
+                        vkQueueSubmit(queue, 1, &si, VK_NULL_HANDLE);
+                        VkResult wr = vkQueueWaitIdle(queue);
+                        auto b = std::chrono::high_resolution_clock::now();
+                        if (wr != VK_SUCCESS) return -1.0;
+                        return std::chrono::duration<double>(b - a).count();
+                    };
+                    once(); once();   // warmup
+                    double best = 1e30; bool lost = false;
+                    for (int t = 0; t < 5; ++t) {
+                        double s = once();
+                        if (s < 0) { lost = true; break; }
+                        if (s < best) best = s;
+                    }
+                    vkDestroyPipeline(device, pipeline, nullptr);
+                    if (lost) { rep.line("  repeats=%u: device-lost (VkResult=-4)", repeats); continue; }
+
+                    double macs = 16.0 * 16.0 * 16.0 * (double)NACC * (double)repeats * (double)totalSubgroups;
+                    double ops = 2.0 * macs;
+                    double rate = ops / best / 1e12;       // TFLOPS/TOPS (2-op)
+                    rep.line("  repeats=%5u: time=%.3f ms | compute=%.1f %s | %.2f %s (2-op) = %.2f TMAC/s",
+                             repeats, best * 1e3, ops / 1e9, opUnit, rate, rateUnit, rate / 2.0);
+                }
+
+                freeBufP(bufA); freeBufP(bufB); freeBufP(bufC); freeBufP(bufD);
+                vkDestroyShaderModule(device, module, nullptr);
+            }
+        }
 
         vkDestroyCommandPool(device, cmdPool, nullptr);
         vkDestroyDescriptorPool(device, descPool, nullptr);
