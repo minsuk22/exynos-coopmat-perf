@@ -25,6 +25,9 @@ For a detailed breakdown of the matrix operation and the data types it
 exercises, see [docs/matrix-operation-analysis.md](docs/matrix-operation-analysis.md)
 ([한글](docs/matrix-operation-analysis.ko.md)).
 
+왜 MATMUL에서는 FP16/INT8 성능 차이가 사라지는지(메모리 바운드)에 대한 설명:
+[docs/matmul-vs-wmma-peak-ko.md](docs/matmul-vs-wmma-peak-ko.md).
+
 ## Differences from the upstream NVIDIA benchmark
 
 | Upstream | This port |
