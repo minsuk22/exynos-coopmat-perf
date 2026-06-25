@@ -1,0 +1,95 @@
+/*
+ * Compute-bound companion to gemm_coopmat.comp.
+ *
+ * Goal: measure the matrix engine's peak throughput with DRAM bandwidth taken
+ * out of the picture. Instead of streaming A and B from global memory, every
+ * subgroup loads ONE small A tile and ONE small B tile from a fixed address
+ * (offset 0) that all subgroups share, so the working set stays resident in
+ * cache. It then accumulates over K using only coopMatMulAdd -- no further
+ * loads. The accumulators are stored at the end so the K-loop is not
+ * dead-code eliminated; that store is a single M*N pass, negligible vs compute.
+ *
+ * The result D is meaningless (every subgroup multiplies the same tile), but
+ * this benchmark never verifies D -- only throughput is measured. FLOP count is
+ * identical to the real GEMM (same grid, same per-subgroup MulAdd count), so the
+ * reported TFLOPS/TOPS are directly comparable to the memory path.
+ *
+ * Compile-time defines (same as gemm_coopmat.comp):
+ *   A_TYPE = float16_t | int8_t | uint8_t | ...
+ *   C_TYPE = float32_t | float16_t | int32_t | ...
+ */
+#version 450 core
+#pragma use_vulkan_memory_model
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_memory_scope_semantics : enable
+#extension GL_KHR_cooperative_matrix : enable
+#extension GL_EXT_shader_explicit_arithmetic_types : enable
+#extension GL_EXT_control_flow_attributes : enable
+
+layout(constant_id = 0) const uint lM = 16;
+layout(constant_id = 1) const uint lN = 16;
+layout(constant_id = 2) const uint lK = 16;
+
+layout(constant_id = 3) const uint M = 4096;
+layout(constant_id = 4) const uint N = 4096;
+layout(constant_id = 5) const uint K = 4096;
+
+layout(constant_id = 6) const uint C_ROWS = 2;
+layout(constant_id = 7) const uint C_COLS = 2;
+
+layout(constant_id = 8) const uint WG_W = 4;
+layout(constant_id = 9) const uint WG_H = 2;
+
+layout(constant_id = 10) const float alpha = 1.0;
+layout(constant_id = 11) const float beta  = 0.0;
+
+layout(local_size_x_id = 12, local_size_y = 1, local_size_z = 1) in;
+
+const uint TILE_M = WG_H * C_ROWS * lM;
+const uint TILE_N = WG_W * C_COLS * lN;
+
+layout(set = 0, binding = 0) readonly  buffer BufA { A_TYPE a[]; };
+layout(set = 0, binding = 1) readonly  buffer BufB { A_TYPE b[]; };
+layout(set = 0, binding = 2) readonly  buffer BufC { C_TYPE c[]; };
+layout(set = 0, binding = 3) writeonly buffer BufD { C_TYPE d[]; };
+
+void main()
+{
+    uvec2 tileID = uvec2(gl_WorkGroupID.xy);
+    uint  sgid   = gl_SubgroupID;
+    uvec2 warp   = uvec2(sgid % WG_W, sgid / WG_W);
+
+    // Load one A tile and one B tile from a fixed, shared address. Every subgroup
+    // reads the same small region, so after the first access it lives in cache
+    // and the K-loop below issues no DRAM traffic.
+    coopmat<A_TYPE, gl_ScopeSubgroup, lM, lK, gl_MatrixUseA> matA;
+    coopmat<A_TYPE, gl_ScopeSubgroup, lK, lN, gl_MatrixUseB> matB;
+    coopMatLoad(matA, a, 0, lK, gl_CooperativeMatrixLayoutRowMajor);
+    coopMatLoad(matB, b, 0, lN, gl_CooperativeMatrixLayoutRowMajor);
+
+    coopmat<C_TYPE, gl_ScopeSubgroup, lM, lN, gl_MatrixUseAccumulator> acc[C_ROWS][C_COLS];
+    [[unroll]] for (uint i = 0; i < C_ROWS; ++i) {
+        [[unroll]] for (uint j = 0; j < C_COLS; ++j) {
+            acc[i][j] = coopmat<C_TYPE, gl_ScopeSubgroup, lM, lN, gl_MatrixUseAccumulator>(0);
+        }
+    }
+
+    // Pure compute: march over K doing only multiply-accumulate on the resident
+    // tiles. The accumulator dependency chain prevents the loop from folding.
+    for (uint k = 0; k < K; k += lK) {
+        [[unroll]] for (uint i = 0; i < C_ROWS; ++i) {
+            [[unroll]] for (uint j = 0; j < C_COLS; ++j) {
+                acc[i][j] = coopMatMulAdd(matA, matB, acc[i][j]);
+            }
+        }
+    }
+
+    // Store so the work is observable (keeps the K-loop alive).
+    [[unroll]] for (uint i = 0; i < C_ROWS; ++i) {
+        uint gi = TILE_M * tileID.y + lM * (C_ROWS * warp.y + i);
+        [[unroll]] for (uint j = 0; j < C_COLS; ++j) {
+            uint gj = TILE_N * tileID.x + lN * (C_COLS * warp.x + j);
+            coopMatStore(acc[i][j], d, gi * N + gj, N, gl_CooperativeMatrixLayoutRowMajor);
+        }
+    }
+}

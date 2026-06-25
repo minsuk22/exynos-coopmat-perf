@@ -296,15 +296,16 @@ static float halfToFloat(uint16_t h) {
 struct TypeCombo {
     VkComponentTypeKHR inputType;
     VkComponentTypeKHR outputType;
-    const char *spvFile;
+    const char *spvFile;         // memory GEMM (streams A/B from DRAM)
+    const char *computeSpvFile;  // compute-bound (cache-resident tile, MulAdd over K)
     bool isFloat;
 };
 
 static const TypeCombo kCombos[] = {
-    { VK_COMPONENT_TYPE_FLOAT16_KHR, VK_COMPONENT_TYPE_FLOAT32_KHR, "gemm_fp16_fp32.spv", true },
-    { VK_COMPONENT_TYPE_FLOAT16_KHR, VK_COMPONENT_TYPE_FLOAT16_KHR, "gemm_fp16_fp16.spv", true },
-    { VK_COMPONENT_TYPE_SINT8_KHR,   VK_COMPONENT_TYPE_SINT32_KHR,  "gemm_s8_s32.spv",   false },
-    { VK_COMPONENT_TYPE_UINT8_KHR,   VK_COMPONENT_TYPE_UINT32_KHR,  "gemm_u8_u32.spv",   false },
+    { VK_COMPONENT_TYPE_FLOAT16_KHR, VK_COMPONENT_TYPE_FLOAT32_KHR, "gemm_fp16_fp32.spv", "gemm_compute_fp16_fp32.spv", true },
+    { VK_COMPONENT_TYPE_FLOAT16_KHR, VK_COMPONENT_TYPE_FLOAT16_KHR, "gemm_fp16_fp16.spv", "gemm_compute_fp16_fp16.spv", true },
+    { VK_COMPONENT_TYPE_SINT8_KHR,   VK_COMPONENT_TYPE_SINT32_KHR,  "gemm_s8_s32.spv",   "gemm_compute_s8_s32.spv",   false },
+    { VK_COMPONENT_TYPE_UINT8_KHR,   VK_COMPONENT_TYPE_UINT32_KHR,  "gemm_u8_u32.spv",   "gemm_compute_u8_u32.spv",   false },
 };
 
 static int32_t findMemoryType(const VkPhysicalDeviceMemoryProperties &mp,
@@ -422,8 +423,8 @@ static void dumpPipelineExecutables(
 // Print the GLSL shader source (bundled alongside the SPIR-V) into the report,
 // so the report shows exactly what shader was compiled and run.
 // ---------------------------------------------------------------------------
-static void dumpShaderSource(const std::string &shaderDir, Report &rep) {
-    std::string path = shaderDir + "/gemm_coopmat.comp";
+static void dumpOneShaderSource(const std::string &shaderDir, const char *name, Report &rep) {
+    std::string path = shaderDir + "/" + name;
     std::ifstream f(path, std::ios::binary | std::ios::ate);
     rep.line("");
     if (!f) {
@@ -434,11 +435,16 @@ static void dumpShaderSource(const std::string &shaderDir, Report &rep) {
     f.seekg(0);
     std::string src((size_t)(sz > 0 ? sz : 0), '\0');
     if (sz > 0) f.read(&src[0], sz);
-    rep.line("==== Shader source: gemm_coopmat.comp (%ld bytes) ====", (long)sz);
-    rep.line("(generic GEMM; specialized per type via -DA_TYPE / -DC_TYPE at compile time)");
+    rep.line("==== Shader source: %s (%ld bytes) ====", name, (long)sz);
     rep.raw(src);
     if (src.empty() || src.back() != '\n') rep.raw("\n");
-    rep.line("==== end shader source ====");
+    rep.line("==== end %s ====", name);
+}
+
+static void dumpShaderSource(const std::string &shaderDir, Report &rep) {
+    // Both shaders are generic GEMM, specialized per type via -DA_TYPE/-DC_TYPE.
+    dumpOneShaderSource(shaderDir, "gemm_coopmat.comp", rep);          // memory GEMM
+    dumpOneShaderSource(shaderDir, "gemm_coopmat_compute.comp", rep);  // compute-bound
 }
 
 // ---------------------------------------------------------------------------
@@ -736,12 +742,13 @@ static std::string runBenchmark(const std::string &shaderDir) {
             const TypeCombo *combo;
             VkCooperativeMatrixPropertiesKHR shape;
             bool found;
+            bool computeBound;   // true -> use the compute-bound shader
         };
         std::vector<Plan> plans;
         for (const auto &combo : kCombos) {
             if (combo.isFloat && !canFloat) continue;
             if (!combo.isFloat && !canInt) continue;
-            Plan pl{ &combo, {}, false };
+            Plan pl{ &combo, {}, false, false };
             for (const auto &c : coop) {
                 if (c.scope == VK_SCOPE_SUBGROUP_KHR &&
                     c.AType == combo.inputType && c.BType == combo.inputType &&
@@ -749,7 +756,12 @@ static std::string runBenchmark(const std::string &shaderDir) {
                     pl.shape = c; pl.found = true; break;
                 }
             }
-            if (pl.found) plans.push_back(pl);
+            if (pl.found) {
+                // Measure each type twice: the real memory GEMM and the
+                // compute-bound variant (DRAM bandwidth removed) for comparison.
+                pl.computeBound = false; plans.push_back(pl);
+                pl.computeBound = true;  plans.push_back(pl);
+            }
         }
 
         if (plans.empty()) {
@@ -816,16 +828,20 @@ static std::string runBenchmark(const std::string &shaderDir) {
             const VkCooperativeMatrixPropertiesKHR &shape = pl.shape;
             uint32_t lM = shape.MSize, lN = shape.NSize, lK = shape.KSize;
 
+            const char *spvFile = pl.computeBound ? combo.computeSpvFile : combo.spvFile;
+            const char *modeLabel = pl.computeBound ? "compute-bound (DRAM removed)"
+                                                    : "memory GEMM";
+
             rep.line("");
-            rep.line("---- %s*%s -> %s   shape %ux%ux%u ----",
+            rep.line("---- %s*%s -> %s   shape %ux%ux%u   [%s] ----",
                      componentTypeName(combo.inputType), componentTypeName(combo.inputType),
-                     componentTypeName(combo.outputType), lM, lN, lK);
+                     componentTypeName(combo.outputType), lM, lN, lK, modeLabel);
 
             // Dump the compiled GPU ISA once per type (first pipeline built).
             bool dumpedExec = false;
 
             // Load SPIR-V.
-            std::string path = shaderDir + "/" + combo.spvFile;
+            std::string path = shaderDir + "/" + spvFile;
             std::ifstream f(path, std::ios::binary | std::ios::ate);
             if (!f) { rep.line("SKIP: shader not found: %s", path.c_str()); continue; }
             std::streamsize sz = f.tellg();
@@ -838,7 +854,7 @@ static std::string runBenchmark(const std::string &shaderDir) {
             smci.pCode = (const uint32_t *)spv.data();
             VkShaderModule module;
             if (vkCreateShaderModule(device, &smci, nullptr, &module) != VK_SUCCESS) {
-                rep.line("SKIP: failed to create shader module for %s", combo.spvFile);
+                rep.line("SKIP: failed to create shader module for %s", spvFile);
                 continue;
             }
 
