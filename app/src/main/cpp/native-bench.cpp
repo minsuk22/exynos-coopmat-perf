@@ -1366,10 +1366,16 @@ static std::string runBenchmark(const std::string &shaderDir) {
                         if (lost) { rep.line("    reuse=%3d%%: device-lost (VkResult=-4)", reuse); continue; }
 
                         double rate = ops / best / 1e12;   // TFLOPS/TOPS (2-op)
-                        rep.line("    reuse=%3d%% (reloads=%u/10, wg=%u, sg=%llu): "
-                                 "time=%.3f ms | %.2f %s (2-op) = %.2f TMAC/s",
-                                 reuse, reloadsPer10, workgroups, (unsigned long long)totalSubgroups,
-                                 best * 1e3, rate, rateUnit, rate / 2.0);
+                        // Bandwidth of the A/B tile loads (2 tiles per reload, plus
+                        // the one initial load per subgroup). At low reuse the
+                        // footprint exceeds cache, so this approaches real DRAM BW.
+                        double reloadsPerSg = (double)repeats * (double)reloadsPer10 / 10.0;
+                        double loadBytes = (double)totalSubgroups * 2.0 * (1.0 + reloadsPerSg) * 256.0 * (double)inElem;
+                        double bw = loadBytes / best / 1e9;   // GB/s
+                        rep.line("    reuse=%3d%% (reloads=%u/10, sg=%llu): time=%.3f ms | "
+                                 "%.2f %s = %.2f TMAC/s | A/B load BW=%.1f GB/s",
+                                 reuse, reloadsPer10, (unsigned long long)totalSubgroups,
+                                 best * 1e3, rate, rateUnit, rate / 2.0, bw);
                     }
                 }
 
@@ -1455,7 +1461,7 @@ static std::string runBenchmark(const std::string &shaderDir) {
 
                 struct Cfg { uint32_t inv, cR, cC; };
                 const Cfg cfgs[] = { { 256, 2, 2 }, { 256, 4, 2 }, { 128, 2, 2 } };
-                double bestRate = 0.0, bestMs = 0.0; uint32_t bTileM = 0, bTileN = 0;
+                double bestRate = 0.0, bestMs = 0.0, bestBW = 0.0; uint32_t bTileM = 0, bTileN = 0;
 
                 for (const auto &cfg : cfgs) {
                     uint32_t numSg = std::max(1u, cfg.inv / reqSg);
@@ -1556,18 +1562,25 @@ static std::string runBenchmark(const std::string &shaderDir) {
                     if (!lost) {
                         double ops = 2.0 * (double)M * (double)N * (double)K * (double)R;
                         double rate = ops / best / 1e12;
-                        double msPerMatmul = best * 1e3 / R;
-                        rep.line("  tile %ux%u (R=%u, dim=%ux%ux%u): %.4f ms/matmul | %.2f %s = %.2f TMAC/s",
-                                 tileM, tileN, R, M, N, K, msPerMatmul, rate, rateUnit, rate / 2.0);
-                        if (rate > bestRate) { bestRate = rate; bestMs = msPerMatmul; bTileM = tileM; bTileN = tileN; }
+                        double msPerMatmul = best / (double)R;
+                        // Algorithmic per-matmul DRAM bandwidth: A and B read once,
+                        // C read, D written (the minimum traffic a single matmul
+                        // needs if perfectly cached internally).
+                        double uniqueBytes = ((double)M * K + (double)K * N) * inElem + 2.0 * (double)M * N * outElem;
+                        double minBW = uniqueBytes / msPerMatmul / 1e9;   // GB/s
+                        rep.line("  tile %ux%u (R=%u, dim=%ux%ux%u): %.4f ms/matmul | %.2f %s = %.2f TMAC/s "
+                                 "| min DRAM BW=%.1f GB/s",
+                                 tileM, tileN, R, M, N, K, msPerMatmul * 1e3, rate, rateUnit, rate / 2.0, minBW);
+                        if (rate > bestRate) { bestRate = rate; bestMs = msPerMatmul * 1e3; bTileM = tileM; bTileN = tileN; bestBW = minBW; }
                     } else rep.line("  cfg device-lost mid-measurement");
 
                     freeBufDL(bA); freeBufDL(bB); freeBufDL(bC); freeBufDL(bD);
                 }
                 vkDestroyShaderModule(device, module, nullptr);
                 if (bestRate > 0.0)
-                    rep.line("  BEST: tile %ux%u  %.4f ms/matmul | %.2f %s = %.2f TMAC/s",
-                             bTileM, bTileN, bestMs, bestRate, rateUnit, bestRate / 2.0);
+                    rep.line("  BEST: tile %ux%u  %.4f ms/matmul | %.2f %s = %.2f TMAC/s "
+                             "| min DRAM BW=%.1f GB/s",
+                             bTileM, bTileN, bestMs, bestRate, rateUnit, bestRate / 2.0, bestBW);
             }
         }
 
