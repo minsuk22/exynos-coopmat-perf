@@ -1,0 +1,81 @@
+/*
+ * Plain FMA/MAD GEMM (NO cooperative matrix / WMMA).
+ *
+ * Same C = A*B as the coopmat GEMM, but each thread computes a TM x TN micro-tile
+ * of the output with scalar fused multiply-adds (floating point) or integer
+ * multiply-adds, using the regular ALU instead of the matrix (WMMA) unit. Shared
+ * memory tiling (BM x BK of A, BK x BN of B) provides reuse, mirroring the tiled
+ * coopmat shader, so the two can be compared directly.
+ *
+ * M,N must be multiples of BM,BN and K a multiple of BK (host pads accordingly).
+ *
+ * Compile-time defines: A_TYPE (input), C_TYPE (accumulator/output).
+ */
+#version 450 core
+#extension GL_EXT_shader_explicit_arithmetic_types : enable
+#extension GL_EXT_control_flow_attributes : enable
+
+layout(constant_id = 0) const uint M  = 2048;
+layout(constant_id = 1) const uint N  = 2048;
+layout(constant_id = 2) const uint K  = 2048;
+layout(constant_id = 3) const uint BM = 64;   // workgroup output rows
+layout(constant_id = 4) const uint BN = 64;   // workgroup output cols
+layout(constant_id = 5) const uint BK = 16;   // K-block staged in shared memory
+layout(constant_id = 6) const uint TM = 4;    // per-thread output rows
+layout(constant_id = 7) const uint TN = 4;    // per-thread output cols
+layout(local_size_x_id = 8, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly  buffer BufA { A_TYPE a[]; };
+layout(set = 0, binding = 1) readonly  buffer BufB { A_TYPE b[]; };
+layout(set = 0, binding = 2) readonly  buffer BufC { C_TYPE c[]; };
+layout(set = 0, binding = 3) writeonly buffer BufD { C_TYPE d[]; };
+
+shared A_TYPE As[BM * BK];   // row-major BM x BK
+shared A_TYPE Bs[BK * BN];   // row-major BK x BN
+
+void main()
+{
+    uint nthreads = gl_WorkGroupSize.x;
+    uint tid      = gl_LocalInvocationID.x;
+    uint threadsX = BN / TN;            // threads spanning the N tile
+    uint tx       = tid % threadsX;
+    uint ty       = tid / threadsX;
+    uint rowBase  = gl_WorkGroupID.y * BM;
+    uint colBase  = gl_WorkGroupID.x * BN;
+
+    C_TYPE acc[TM][TN];
+    [[unroll]] for (uint i = 0; i < TM; ++i)
+        [[unroll]] for (uint j = 0; j < TN; ++j) acc[i][j] = C_TYPE(0);
+
+    for (uint k0 = 0; k0 < K; k0 += BK) {
+        barrier();
+        for (uint idx = tid; idx < BM * BK; idx += nthreads) {
+            uint i = idx / BK, kk = idx % BK;
+            As[idx] = a[(rowBase + i) * K + (k0 + kk)];
+        }
+        for (uint idx = tid; idx < BK * BN; idx += nthreads) {
+            uint kk = idx / BN, j = idx % BN;
+            Bs[idx] = b[(k0 + kk) * N + (colBase + j)];
+        }
+        barrier();
+
+        [[unroll]] for (uint kk = 0; kk < BK; ++kk) {
+            A_TYPE ar[TM];
+            A_TYPE br[TN];
+            [[unroll]] for (uint i = 0; i < TM; ++i) ar[i] = As[(ty * TM + i) * BK + kk];
+            [[unroll]] for (uint j = 0; j < TN; ++j) br[j] = Bs[kk * BN + (tx * TN + j)];
+            // The actual multiply-accumulate: scalar FMA (float) or MAD (int).
+            [[unroll]] for (uint i = 0; i < TM; ++i)
+                [[unroll]] for (uint j = 0; j < TN; ++j)
+                    acc[i][j] = C_TYPE(ar[i]) * C_TYPE(br[j]) + acc[i][j];
+        }
+    }
+
+    [[unroll]] for (uint i = 0; i < TM; ++i) {
+        uint gi = rowBase + ty * TM + i;
+        [[unroll]] for (uint j = 0; j < TN; ++j) {
+            uint gj = colBase + tx * TN + j;
+            d[gi * N + gj] = acc[i][j];
+        }
+    }
+}
