@@ -1023,77 +1023,104 @@ static std::string runBenchmark(const std::string &shaderDir) {
                 }
 
                 uint32_t gx = N / tileN, gy = M / tileM;
-                // Small problems finish too fast to time reliably: 1000 iters at
-                // 1024/2048, 100 elsewhere.
-                const uint32_t repeats = (dim == 1024 || dim == 2048) ? 1000 : 100;
-
-                // Record compute command buffer.
-                vkBeginCommandBuffer(cmd, &bi);
-                vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayout, 0, 1, &descSet, 0, nullptr);
-                vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
-                // No barrier between dispatches: A/B inputs are unchanged and D
-                // is not verified, so the iterations run back-to-back and overlap
-                // (the tail of one fills the ramp-up of the next), measuring
-                // steady-state throughput instead of draining the GPU each time.
-                for (uint32_t i = 0; i < repeats; ++i) {
-                    vkCmdDispatch(cmd, gx, gy, 1);
-                }
-                vkEndCommandBuffer(cmd);
-
                 si.pCommandBuffers = &cmd;
 
-                // Warmup.
-                for (int w = 0; w < 3; ++w) {
+                // A single long submission trips the GPU watchdog
+                // (VK_ERROR_DEVICE_LOST, VkResult=-4): when one submit runs too
+                // long the driver kills the device and everything after fails.
+                // So we (1) time a single dispatch, (2) skip the dim if even one
+                // dispatch is already over the cutoff, and (3) run the requested
+                // iteration count in small batches that each stay well under the
+                // watchdog.
+                VkResult waitRes = VK_SUCCESS;
+                auto recordDispatches = [&](uint32_t n) {
+                    vkBeginCommandBuffer(cmd, &bi);
+                    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayout, 0, 1, &descSet, 0, nullptr);
+                    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
+                    // No barrier between dispatches: A/B are unchanged and D is not
+                    // verified, so iterations overlap (steady-state throughput).
+                    for (uint32_t i = 0; i < n; ++i) vkCmdDispatch(cmd, gx, gy, 1);
+                    vkEndCommandBuffer(cmd);
+                };
+                auto timedSubmit = [&]() -> double {
+                    auto a = std::chrono::high_resolution_clock::now();
                     vkQueueSubmit(queue, 1, &si, VK_NULL_HANDLE);
-                    vkQueueWaitIdle(queue);
-                }
+                    waitRes = vkQueueWaitIdle(queue);
+                    auto b = std::chrono::high_resolution_clock::now();
+                    return std::chrono::duration<double>(b - a).count();
+                };
+                auto cleanup = [&]() {
+                    vkDestroyPipeline(device, pipeline, nullptr);
+                    freeBuf(bufA); freeBuf(bufB); freeBuf(bufC); freeBuf(bufD);
+                };
 
-                auto t0 = std::chrono::high_resolution_clock::now();
-                vkQueueSubmit(queue, 1, &si, VK_NULL_HANDLE);
-                VkResult waitRes = vkQueueWaitIdle(queue);
-                auto t1 = std::chrono::high_resolution_clock::now();
-
-                double sec = std::chrono::duration<double>(t1 - t0).count();
-
-                // Compute: multiply-add counted as 2 ops, summed over the run.
-                double ops = 2.0 * (double)M * (double)N * (double)K * (double)repeats;
-
-                // Modeled buffer_load traffic: with no shared-memory tiling, A is
-                // re-read once per output column-block and B once per row-block,
-                // while C is read once per output element. (Address-level load
-                // volume before L2 caching.)
-                double aLoadElems = (double)M * (double)N * (double)K / ((double)cCols * (double)lN);
-                double bLoadElems = (double)M * (double)N * (double)K / ((double)cRows * (double)lM);
-                double cLoadElems = (double)M * (double)N;
-                double loadBytes = ((aLoadElems + bLoadElems) * (double)inElem +
-                                    cLoadElems * (double)outElem) * (double)repeats;
-
-                double rate = ops / sec / 1e12;       // TFLOPS or TOPS
-                double bw   = loadBytes / sec / 1e9;   // GB/s
                 const char *opUnit   = combo.isFloat ? "GFLOP"  : "GOP";
                 const char *rateUnit = combo.isFloat ? "TFLOPS" : "TOPS";
+                auto reportRun = [&](double sec, uint32_t reps) {
+                    double ops = 2.0 * (double)M * (double)N * (double)K * (double)reps;
+                    // Modeled buffer_load traffic: with no shared-memory tiling, A
+                    // is re-read per output column-block, B per row-block, C once.
+                    double aLoadElems = (double)M * (double)N * (double)K / ((double)cCols * (double)lN);
+                    double bLoadElems = (double)M * (double)N * (double)K / ((double)cRows * (double)lM);
+                    double cLoadElems = (double)M * (double)N;
+                    double loadBytes = ((aLoadElems + bLoadElems) * (double)inElem +
+                                        cLoadElems * (double)outElem) * (double)reps;
+                    rep.line("  dim=%ux%ux%u tile=%ux%u (sg=%ux%u x%u, inv=%u, %u iters):",
+                             M, N, K, tileM, tileN, wgW, wgH, reqSg, localX, reps);
+                    rep.line("      time    = %.3f ms (%.4f ms/iter)", sec * 1e3, sec * 1e3 / reps);
+                    rep.line("      compute = %.1f %s", ops / 1e9, opUnit);
+                    rep.line("      load    = %.2f GB (buffer_load traffic, modeled)", loadBytes / 1e9);
+                    rep.line("      => %.3f %s, %.1f GB/s",
+                             ops / sec / 1e12, rateUnit, loadBytes / sec / 1e9);
+                };
 
-                double msIter = sec * 1e3 / repeats;
-                rep.line("  dim=%ux%ux%u tile=%ux%u (sg=%ux%u x%u, inv=%u, %u iters):",
-                         M, N, K, tileM, tileN, wgW, wgH, reqSg, localX, repeats);
-                rep.line("      time    = %.3f ms (%.4f ms/iter)", sec * 1e3, msIter);
-                rep.line("      compute = %.1f %s", ops / 1e9, opUnit);
-                rep.line("      load    = %.2f GB (buffer_load traffic, modeled)", loadBytes / 1e9);
-                rep.line("      => %.3f %s, %.1f GB/s", rate, rateUnit, bw);
-                if (waitRes != VK_SUCCESS)
-                    rep.line("      WARNING: vkQueueWaitIdle returned VkResult=%d "
-                             "(likely GPU job timeout / device-lost; result invalid)", (int)waitRes);
-
-                vkDestroyPipeline(device, pipeline, nullptr);
-                freeBuf(bufA); freeBuf(bufB); freeBuf(bufC); freeBuf(bufD);
-
-                // Once an iteration crosses 250 ms (or the device timed out), stop
-                // growing the problem for this config and move on to the next one.
-                if (msIter > 250.0 || waitRes != VK_SUCCESS) {
-                    rep.line("      (ms/iter %.1f exceeds 250 ms -> skipping larger dims for this config)",
-                             msIter);
+                // (1) Calibrate with a single dispatch (first call also warms up).
+                recordDispatches(1);
+                timedSubmit();
+                double oneSec = timedSubmit();
+                double oneMs = oneSec * 1e3;
+                if (waitRes != VK_SUCCESS) {
+                    rep.line("  dim=%ux%ux%u tile=%ux%u: device-lost on a single dispatch "
+                             "(VkResult=%d) -> skipping this and larger dims",
+                             M, N, K, tileM, tileN, (int)waitRes);
+                    cleanup();
                     break;
                 }
+
+                // (2) One dispatch already over the cutoff: report it and stop.
+                if (oneMs > 250.0) {
+                    reportRun(oneSec, 1);
+                    rep.line("      (ms/iter %.1f exceeds 250 ms -> skipping larger dims for this config)", oneMs);
+                    cleanup();
+                    break;
+                }
+
+                // (3) Run the requested iterations in batches that each stay
+                // ~<=200 ms (well under the watchdog), up to a ~3 s wall budget.
+                uint32_t targetIters = (dim == 1024 || dim == 2048) ? 1000 : 100;
+                uint32_t batch = (oneMs > 0.001) ? (uint32_t)(200.0 / oneMs) : targetIters;
+                if (batch < 1) batch = 1;
+                if (batch > targetIters) batch = targetIters;
+                recordDispatches(batch);
+                timedSubmit();   // warm up the batched command buffer
+
+                double totalSec = 0.0;
+                uint32_t iters = 0;
+                while (iters < targetIters && totalSec < 3.0) {
+                    double s = timedSubmit();
+                    if (waitRes != VK_SUCCESS) break;
+                    totalSec += s;
+                    iters += batch;
+                }
+                if (waitRes != VK_SUCCESS) {
+                    rep.line("  dim=%ux%ux%u tile=%ux%u: device-lost mid-measurement "
+                             "(VkResult=%d) -> skipping larger dims", M, N, K, tileM, tileN, (int)waitRes);
+                    cleanup();
+                    break;
+                }
+
+                reportRun(totalSec, iters ? iters : 1);
+                cleanup();
                 } // dim sweep
             } // cfg
 
