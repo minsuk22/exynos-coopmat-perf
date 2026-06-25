@@ -1,18 +1,20 @@
 /*
  * Compute-bound companion to gemm_coopmat.comp.
  *
- * Goal: measure the matrix engine's peak throughput with DRAM bandwidth taken
- * out of the picture. Instead of streaming A and B from global memory, every
- * subgroup loads ONE small A tile and ONE small B tile from a fixed address
- * (offset 0) that all subgroups share, so the working set stays resident in
- * cache. It then accumulates over K using only coopMatMulAdd -- no further
- * loads. The accumulators are stored at the end so the K-loop is not
- * dead-code eliminated; that store is a single M*N pass, negligible vs compute.
+ * Goal: measure the matrix engine's throughput with DRAM bandwidth taken out of
+ * the picture, WITHOUT letting the compiler fold the K-loop away.
  *
- * The result D is meaningless (every subgroup multiplies the same tile), but
- * this benchmark never verifies D -- only throughput is measured. FLOP count is
- * identical to the real GEMM (same grid, same per-subgroup MulAdd count), so the
- * reported TFLOPS/TOPS are directly comparable to the memory path.
+ * Trick: it is the same K-march as the real GEMM, but the load addresses do NOT
+ * depend on tileID/warp -- every subgroup reads the SAME small top-left strips
+ * of A (C_ROWS*lM rows x K) and B (K x C_COLS*lN cols). Those strips are a few
+ * hundred KB, so after the first touch they live in cache and the inner loop
+ * issues no DRAM traffic. Because the tiles still change every iteration (real
+ * per-k loads), the accumulation is not a loop-invariant closed form, so the
+ * compiler cannot collapse the K-loop. FLOP count and structure are identical to
+ * the real GEMM, so the reported TFLOPS/TOPS are directly comparable.
+ *
+ * The result D is meaningless (every subgroup computes the same tile), but this
+ * benchmark never verifies D -- only throughput is measured.
  *
  * Compile-time defines (same as gemm_coopmat.comp):
  *   A_TYPE = float16_t | int8_t | uint8_t | ...
@@ -59,14 +61,6 @@ void main()
     uint  sgid   = gl_SubgroupID;
     uvec2 warp   = uvec2(sgid % WG_W, sgid / WG_W);
 
-    // Load one A tile and one B tile from a fixed, shared address. Every subgroup
-    // reads the same small region, so after the first access it lives in cache
-    // and the K-loop below issues no DRAM traffic.
-    coopmat<A_TYPE, gl_ScopeSubgroup, lM, lK, gl_MatrixUseA> matA;
-    coopmat<A_TYPE, gl_ScopeSubgroup, lK, lN, gl_MatrixUseB> matB;
-    coopMatLoad(matA, a, 0, lK, gl_CooperativeMatrixLayoutRowMajor);
-    coopMatLoad(matB, b, 0, lN, gl_CooperativeMatrixLayoutRowMajor);
-
     coopmat<C_TYPE, gl_ScopeSubgroup, lM, lN, gl_MatrixUseAccumulator> acc[C_ROWS][C_COLS];
     [[unroll]] for (uint i = 0; i < C_ROWS; ++i) {
         [[unroll]] for (uint j = 0; j < C_COLS; ++j) {
@@ -74,17 +68,26 @@ void main()
         }
     }
 
-    // Pure compute: march over K doing only multiply-accumulate on the resident
-    // tiles. The accumulator dependency chain prevents the loop from folding.
+    // March over K, but read the SAME top-left strips for every subgroup (load
+    // address independent of tileID/warp). The strips fit in cache, so there is
+    // no DRAM streaming; the per-k loads still vary, so the loop is real work and
+    // cannot be folded.
     for (uint k = 0; k < K; k += lK) {
+        coopmat<A_TYPE, gl_ScopeSubgroup, lM, lK, gl_MatrixUseA> matA[C_ROWS];
         [[unroll]] for (uint i = 0; i < C_ROWS; ++i) {
-            [[unroll]] for (uint j = 0; j < C_COLS; ++j) {
-                acc[i][j] = coopMatMulAdd(matA, matB, acc[i][j]);
+            coopMatLoad(matA[i], a, (lM * i) * K + k, K, gl_CooperativeMatrixLayoutRowMajor);
+        }
+        [[unroll]] for (uint j = 0; j < C_COLS; ++j) {
+            coopmat<A_TYPE, gl_ScopeSubgroup, lK, lN, gl_MatrixUseB> matB;
+            coopMatLoad(matB, b, k * N + (lN * j), N, gl_CooperativeMatrixLayoutRowMajor);
+            [[unroll]] for (uint i = 0; i < C_ROWS; ++i) {
+                acc[i][j] = coopMatMulAdd(matA[i], matB, acc[i][j]);
             }
         }
     }
 
-    // Store so the work is observable (keeps the K-loop alive).
+    // Store at the real output position so the writes are distinct and the work
+    // stays observable (the K-loop is not dead-code eliminated).
     [[unroll]] for (uint i = 0; i < C_ROWS; ++i) {
         uint gi = TILE_M * tileID.y + lM * (C_ROWS * warp.y + i);
         [[unroll]] for (uint j = 0; j < C_COLS; ++j) {
