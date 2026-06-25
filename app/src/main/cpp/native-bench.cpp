@@ -28,6 +28,7 @@
 #include <vector>
 #include <fstream>
 #include <chrono>
+#include <thread>
 #include <cmath>
 #include <algorithm>
 
@@ -1147,7 +1148,8 @@ static std::string runBenchmark(const std::string &shaderDir) {
 
             const uint32_t NACC = 4;
             const uint32_t SG_PER_WG = 4;
-            const uint32_t repeatCounts[] = { 1024, 4096, 8196 };
+            const uint32_t repeatCounts[] = { 1024, 2048 };
+            const int ROUNDS = 10;   // measurements per (type, repeats), 1 s apart
             uint32_t localX = reqSg * SG_PER_WG;
             // A single submission longer than the GPU watchdog makes
             // vkQueueWaitIdle block forever. 8192 subgroups x 1024 repeats ran
@@ -1307,22 +1309,29 @@ static std::string runBenchmark(const std::string &shaderDir) {
                         if (wr != VK_SUCCESS) return -1.0;
                         return std::chrono::duration<double>(b - a).count();
                     };
-                    once();   // warmup
-                    double best = 1e30; bool lost = false;
-                    for (int t = 0; t < 3; ++t) {
-                        double s = once();
-                        if (s < 0) { lost = true; break; }
-                        if (s < best) best = s;
-                    }
-                    vkDestroyPipeline(device, pipeline, nullptr);
-                    if (lost) { rep.line("  repeats=%u: device-lost (VkResult=-4)", repeats); continue; }
-
                     double macs = 16.0 * 16.0 * 16.0 * (double)NACC * (double)repeats * (double)totalSubgroups;
                     double ops = 2.0 * macs;
-                    double rate = ops / best / 1e12;       // TFLOPS/TOPS (2-op)
-                    rep.line("  repeats=%5u (wg=%u, subgroups=%llu): time=%.3f ms | compute=%.1f %s | %.2f %s (2-op) = %.2f TMAC/s",
+
+                    // Run ROUNDS measurements, 1 s apart, printing each so the
+                    // performance over time (DVFS / thermal) is visible.
+                    rep.line("  repeats=%u (wg=%u, subgroups=%llu, compute=%.1f %s/run), "
+                             "%d rounds @ 1 s apart:",
                              repeats, workgroups, (unsigned long long)totalSubgroups,
-                             best * 1e3, ops / 1e9, opUnit, rate, rateUnit, rate / 2.0);
+                             ops / 1e9, opUnit, ROUNDS);
+                    once();   // warmup (not printed)
+                    for (int rnd = 0; rnd < ROUNDS; ++rnd) {
+                        double s = once();
+                        if (s < 0) {
+                            rep.line("    round %2d: device-lost (VkResult=-4)", rnd + 1);
+                            break;
+                        }
+                        double rate = ops / s / 1e12;   // TFLOPS/TOPS (2-op)
+                        rep.line("    round %2d: time=%.3f ms | %.2f %s (2-op) = %.2f TMAC/s",
+                                 rnd + 1, s * 1e3, rate, rateUnit, rate / 2.0);
+                        if (rnd + 1 < ROUNDS)
+                            std::this_thread::sleep_for(std::chrono::seconds(1));
+                    }
+                    vkDestroyPipeline(device, pipeline, nullptr);
                 }
 
                 freeBufP(bufA); freeBufP(bufB); freeBufP(bufC); freeBufP(bufD);
