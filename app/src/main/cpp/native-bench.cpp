@@ -1147,15 +1147,20 @@ static std::string runBenchmark(const std::string &shaderDir) {
 
             const uint32_t NACC = 4;
             const uint32_t SG_PER_WG = 4;
-            const uint32_t WORKGROUPS = 2048;
             const uint32_t repeatCounts[] = { 1024, 4096, 8196 };
             uint32_t localX = reqSg * SG_PER_WG;
-            uint64_t totalSubgroups = (uint64_t)WORKGROUPS * SG_PER_WG;
-            rep.line("config: workgroups=%u, subgroups/wg=%u, total subgroups=%llu, "
-                     "accumulators=%u, subgroupSize=%u",
-                     WORKGROUPS, SG_PER_WG, (unsigned long long)totalSubgroups, NACC, reqSg);
+            // A single submission longer than the GPU watchdog makes
+            // vkQueueWaitIdle block forever. 8192 subgroups x 1024 repeats ran
+            // safely (~38 ms); 4x that hung. So keep subgroups x repeats per
+            // dispatch roughly constant at this budget by scaling the launch down
+            // as repeats grows.
+            const uint64_t WORK_BUDGET = (uint64_t)8192 * 1024;
+            const uint32_t MAX_SUBGROUPS = 8192;   // D is sized for this
+            rep.line("config: subgroups/wg=%u, accumulators=%u, subgroupSize=%u",
+                     SG_PER_WG, NACC, reqSg);
             rep.line("note: TFLOPS/TOPS count a multiply-add as 2 ops; the MAC-based");
-            rep.line("      figure (vendor-style) is half of it.");
+            rep.line("      figure (vendor-style) is half of it. subgroups scale down");
+            rep.line("      as repeats grows to keep each dispatch under the watchdog.");
 
             auto makeBufP = [&](Buffer &b, VkDeviceSize bytes) -> bool {
                 b.size = bytes;
@@ -1220,7 +1225,7 @@ static std::string runBenchmark(const std::string &shaderDir) {
                 bool ok = makeBufP(bufA, tileElems * inElem) &&
                           makeBufP(bufB, tileElems * inElem) &&
                           makeBufP(bufC, tileElems * outElem) &&
-                          makeBufP(bufD, (VkDeviceSize)totalSubgroups * tileElems * outElem);
+                          makeBufP(bufD, (VkDeviceSize)MAX_SUBGROUPS * tileElems * outElem);
                 if (!ok) {
                     rep.line("  buffer alloc failed; skip");
                     freeBufP(bufA); freeBufP(bufB); freeBufP(bufC); freeBufP(bufD);
@@ -1257,6 +1262,14 @@ static std::string runBenchmark(const std::string &shaderDir) {
                 const char *rateUnit = combo.isFloat ? "TFLOPS" : "TOPS";
 
                 for (uint32_t repeats : repeatCounts) {
+                    // Scale the launch so subgroups*repeats ~= WORK_BUDGET, keeping
+                    // each dispatch short enough to avoid the watchdog hang.
+                    uint32_t workgroups = (uint32_t)(WORK_BUDGET / ((uint64_t)repeats * SG_PER_WG));
+                    if (workgroups < 64) workgroups = 64;
+                    if ((uint64_t)workgroups * SG_PER_WG > MAX_SUBGROUPS)
+                        workgroups = MAX_SUBGROUPS / SG_PER_WG;
+                    uint64_t totalSubgroups = (uint64_t)workgroups * SG_PER_WG;
+
                     uint32_t spec[6] = { 16, 16, 16, repeats, NACC, localX };
                     VkSpecializationMapEntry ents[6];
                     for (uint32_t i = 0; i < 6; ++i) ents[i] = { i, (uint32_t)(i * 4), 4 };
@@ -1281,7 +1294,7 @@ static std::string runBenchmark(const std::string &shaderDir) {
                     vkBeginCommandBuffer(cmd, &bi);
                     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayout, 0, 1, &descSet, 0, nullptr);
                     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
-                    vkCmdDispatch(cmd, WORKGROUPS, 1, 1);
+                    vkCmdDispatch(cmd, workgroups, 1, 1);
                     vkEndCommandBuffer(cmd);
                     VkSubmitInfo si = { VK_STRUCTURE_TYPE_SUBMIT_INFO };
                     si.commandBufferCount = 1; si.pCommandBuffers = &cmd;
@@ -1294,9 +1307,9 @@ static std::string runBenchmark(const std::string &shaderDir) {
                         if (wr != VK_SUCCESS) return -1.0;
                         return std::chrono::duration<double>(b - a).count();
                     };
-                    once(); once();   // warmup
+                    once();   // warmup
                     double best = 1e30; bool lost = false;
-                    for (int t = 0; t < 5; ++t) {
+                    for (int t = 0; t < 3; ++t) {
                         double s = once();
                         if (s < 0) { lost = true; break; }
                         if (s < best) best = s;
@@ -1307,8 +1320,9 @@ static std::string runBenchmark(const std::string &shaderDir) {
                     double macs = 16.0 * 16.0 * 16.0 * (double)NACC * (double)repeats * (double)totalSubgroups;
                     double ops = 2.0 * macs;
                     double rate = ops / best / 1e12;       // TFLOPS/TOPS (2-op)
-                    rep.line("  repeats=%5u: time=%.3f ms | compute=%.1f %s | %.2f %s (2-op) = %.2f TMAC/s",
-                             repeats, best * 1e3, ops / 1e9, opUnit, rate, rateUnit, rate / 2.0);
+                    rep.line("  repeats=%5u (wg=%u, subgroups=%llu): time=%.3f ms | compute=%.1f %s | %.2f %s (2-op) = %.2f TMAC/s",
+                             repeats, workgroups, (unsigned long long)totalSubgroups,
+                             best * 1e3, ops / 1e9, opUnit, rate, rateUnit, rate / 2.0);
                 }
 
                 freeBufP(bufA); freeBufP(bufB); freeBufP(bufC); freeBufP(bufD);
