@@ -1465,15 +1465,16 @@ static std::string runBenchmark(const std::string &shaderDir) {
                 const char *rateUnit = combo.isFloat ? "TFLOPS" : "TOPS";
 
                 // Occupancy-tuned configs for the target GPU (64 VGPR/thread,
-                // 128KB LDS per 16 waves, >=512 waves): cR*cC = 4 keeps the
-                // accumulator/register footprint to ~half the VGPR file, and the
-                // small TILE/BK keep LDS per wave low so 16 waves/unit (and >=512
-                // total) stay resident. { cR, cC, WG_W, WG_H, BK }.
+                // 128KB LDS per 64 waves => 2KB/wave budget, 2MB L2, >=512 waves):
+                // cR*cC = 4 keeps the accumulator/register footprint to ~half the
+                // VGPR file; bigger workgroup tiles raise data reuse, but enough
+                // subgroups per workgroup keep LDS per wave <= ~1-2KB so the full
+                // 64 waves/unit stay resident. { cR, cC, WG_W, WG_H, BK }.
                 struct Cfg { uint32_t cR, cC, wgW, wgH, bk; };
                 const Cfg cfgs[] = {
-                    { 2, 2, 2, 2, 32 },   // TILE 64x64,  4 waves/wg
-                    { 2, 2, 4, 2, 32 },   // TILE 64x128, 8 waves/wg
-                    { 2, 2, 2, 2, 16 },   // TILE 64x64,  smaller LDS
+                    { 2, 2, 4, 4, 32 },   // TILE 128x128, 16 waves/wg, ~1KB/wave (best reuse)
+                    { 2, 2, 4, 2, 32 },   // TILE 64x128,   8 waves/wg, ~1.5KB/wave
+                    { 2, 2, 2, 2, 16 },   // TILE 64x64,     4 waves/wg, ~1KB/wave (low LDS)
                 };
                 double bestRate = 0.0, bestMs = 0.0, bestBW = 0.0; uint32_t bTileM = 0, bTileN = 0;
 
@@ -1484,13 +1485,13 @@ static std::string runBenchmark(const std::string &shaderDir) {
                     auto rup = [](uint32_t v, uint32_t a) { return (v + a - 1) / a * a; };
                     uint32_t M = rup(MM, tileM), N = rup(NN, tileN), K = rup(KK, BKc);
 
-                    // Resource / occupancy estimate (vs 128KB LDS per 16 waves).
+                    // Resource / occupancy estimate (128KB LDS shared by up to 64 waves).
                     uint32_t wavesPerWG = wgW * wgH;
                     double ldsBytes = tiled ? (double)(tileM * BKc + BKc * tileN) * (double)inElem : 0.0;
                     double ldsPerWave = wavesPerWG ? ldsBytes / wavesPerWG : 0.0;
                     uint64_t dispatchedWaves = (uint64_t)(M / tileM) * (uint64_t)(N / tileN) * wavesPerWG;
                     uint32_t maxWavesByLds = ldsPerWave > 0.0
-                        ? (uint32_t)std::min(16.0, std::floor(131072.0 / ldsPerWave)) : 16;
+                        ? (uint32_t)std::min(64.0, std::floor(131072.0 / ldsPerWave)) : 64;
                     rep.line("  [cR%u cC%u wg%ux%u bk%u] tile=%ux%u, LDS=%.0f B/wg (%.0f B/wave), "
                              "waves/wg=%u, occ<=%u waves/unit, dispatched=%llu waves",
                              cR, cC, wgW, wgH, BKc, tileM, tileN, ldsBytes, ldsPerWave,
