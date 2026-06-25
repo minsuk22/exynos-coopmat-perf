@@ -424,27 +424,47 @@ static void dumpPipelineExecutables(
 // Print the GLSL shader source (bundled alongside the SPIR-V) into the report,
 // so the report shows exactly what shader was compiled and run.
 // ---------------------------------------------------------------------------
-static void dumpOneShaderSource(const std::string &shaderDir, const char *name, Report &rep) {
+// GLSL type name for a Vulkan cooperative-matrix component type (for showing the
+// shader source specialized to a data type).
+static const char *glslTypeName(VkComponentTypeKHR t) {
+    switch (t) {
+    case VK_COMPONENT_TYPE_FLOAT16_KHR: return "float16_t";
+    case VK_COMPONENT_TYPE_FLOAT32_KHR: return "float32_t";
+    case VK_COMPONENT_TYPE_FLOAT64_KHR: return "float64_t";
+    case VK_COMPONENT_TYPE_SINT8_KHR:   return "int8_t";
+    case VK_COMPONENT_TYPE_SINT16_KHR:  return "int16_t";
+    case VK_COMPONENT_TYPE_SINT32_KHR:  return "int32_t";
+    case VK_COMPONENT_TYPE_UINT8_KHR:   return "uint8_t";
+    case VK_COMPONENT_TYPE_UINT32_KHR:  return "uint32_t";
+    default: return "?";
+    }
+}
+
+// Print the bundled GLSL source with the A_TYPE / C_TYPE macros substituted for a
+// concrete data type, so the report shows the exact shader code per type.
+static void dumpTypedShaderSource(const std::string &shaderDir, const char *name,
+                                  const char *aType, const char *cType, Report &rep) {
     std::string path = shaderDir + "/" + name;
     std::ifstream f(path, std::ios::binary | std::ios::ate);
     rep.line("");
     if (!f) {
-        rep.line("(shader source not bundled: %s)", path.c_str());
+        rep.line("  (shader source not bundled: %s)", path.c_str());
         return;
     }
     std::streamsize sz = f.tellg();
     f.seekg(0);
     std::string src((size_t)(sz > 0 ? sz : 0), '\0');
     if (sz > 0) f.read(&src[0], sz);
-    rep.line("==== Shader source: %s (%ld bytes) ====", name, (long)sz);
+    auto replaceAll = [](std::string &s, const std::string &from, const std::string &to) {
+        size_t p = 0;
+        while ((p = s.find(from, p)) != std::string::npos) { s.replace(p, from.size(), to); p += to.size(); }
+    };
+    replaceAll(src, "A_TYPE", aType);
+    replaceAll(src, "C_TYPE", cType);
+    rep.line("  ==== shader %s (A_TYPE=%s, C_TYPE=%s) ====", name, aType, cType);
     rep.raw(src);
     if (src.empty() || src.back() != '\n') rep.raw("\n");
-    rep.line("==== end %s ====", name);
-}
-
-static void dumpShaderSource(const std::string &shaderDir, Report &rep) {
-    // The active test is the WMMA peak microbenchmark; print its source.
-    dumpOneShaderSource(shaderDir, "wmma_peak.comp", rep);
+    rep.line("  ==== end shader ====");
 }
 
 // ---------------------------------------------------------------------------
@@ -453,7 +473,6 @@ static void dumpShaderSource(const std::string &shaderDir, Report &rep) {
 static std::string runBenchmark(const std::string &shaderDir) {
     Report rep;
     rep.line("=== Exynos Cooperative-Matrix GEMM Benchmark ===");
-    dumpShaderSource(shaderDir, rep);
 
     VkInstance instance = VK_NULL_HANDLE;
     VkDevice device = VK_NULL_HANDLE;
@@ -1206,6 +1225,11 @@ static std::string runBenchmark(const std::string &shaderDir) {
                          componentTypeName(combo.inputType), componentTypeName(combo.inputType),
                          componentTypeName(combo.outputType));
                 if (!have16) { rep.line("  no 16x16x16 subgroup shape advertised; skip"); continue; }
+
+                // Show the exact shader source for this data type.
+                dumpTypedShaderSource(shaderDir, "wmma_peak.comp",
+                                      glslTypeName(combo.inputType),
+                                      glslTypeName(combo.outputType), rep);
 
                 std::string path = shaderDir + "/" + combo.peakSpvFile;
                 std::ifstream f(path, std::ios::binary | std::ios::ate);
