@@ -1430,7 +1430,6 @@ static std::string runBenchmark(const std::string &shaderDir) {
             };
 
             auto benchGemm = [&](bool tiled) {
-              const uint32_t BK = 32;   // K-block staged in shared memory (tiled)
               rep.line("");
               rep.line(tiled ? "########## shared-memory tiled GEMM ##########"
                              : "########## simple GEMM (streams A/B from global) ##########");
@@ -1465,19 +1464,37 @@ static std::string runBenchmark(const std::string &shaderDir) {
                 size_t outElem = componentBits(combo.outputType) / 8;
                 const char *rateUnit = combo.isFloat ? "TFLOPS" : "TOPS";
 
-                struct Cfg { uint32_t inv, cR, cC; };
-                const Cfg cfgs[] = { { 256, 2, 2 }, { 256, 4, 2 }, { 128, 2, 2 } };
+                // Occupancy-tuned configs for the target GPU (64 VGPR/thread,
+                // 128KB LDS per 16 waves, >=512 waves): cR*cC = 4 keeps the
+                // accumulator/register footprint to ~half the VGPR file, and the
+                // small TILE/BK keep LDS per wave low so 16 waves/unit (and >=512
+                // total) stay resident. { cR, cC, WG_W, WG_H, BK }.
+                struct Cfg { uint32_t cR, cC, wgW, wgH, bk; };
+                const Cfg cfgs[] = {
+                    { 2, 2, 2, 2, 32 },   // TILE 64x64,  4 waves/wg
+                    { 2, 2, 4, 2, 32 },   // TILE 64x128, 8 waves/wg
+                    { 2, 2, 2, 2, 16 },   // TILE 64x64,  smaller LDS
+                };
                 double bestRate = 0.0, bestMs = 0.0, bestBW = 0.0; uint32_t bTileM = 0, bTileN = 0;
 
                 for (const auto &cfg : cfgs) {
-                    uint32_t numSg = std::max(1u, cfg.inv / reqSg);
-                    uint32_t wgW = numSg, wgH = 1;
-                    for (uint32_t h = (uint32_t)std::floor(std::sqrt((double)numSg)); h >= 1; --h)
-                        if (numSg % h == 0) { wgH = h; wgW = numSg / h; break; }
-                    uint32_t cR = cfg.cR, cC = cfg.cC;
+                    uint32_t cR = cfg.cR, cC = cfg.cC, wgW = cfg.wgW, wgH = cfg.wgH;
+                    uint32_t BKc = tiled ? cfg.bk : lK;   // K-block (shared) for tiled
                     uint32_t tileM = wgH * cR * lM, tileN = wgW * cC * lN, localX = wgW * wgH * reqSg;
                     auto rup = [](uint32_t v, uint32_t a) { return (v + a - 1) / a * a; };
-                    uint32_t M = rup(MM, tileM), N = rup(NN, tileN), K = rup(KK, tiled ? BK : lK);
+                    uint32_t M = rup(MM, tileM), N = rup(NN, tileN), K = rup(KK, BKc);
+
+                    // Resource / occupancy estimate (vs 128KB LDS per 16 waves).
+                    uint32_t wavesPerWG = wgW * wgH;
+                    double ldsBytes = tiled ? (double)(tileM * BKc + BKc * tileN) * (double)inElem : 0.0;
+                    double ldsPerWave = wavesPerWG ? ldsBytes / wavesPerWG : 0.0;
+                    uint64_t dispatchedWaves = (uint64_t)(M / tileM) * (uint64_t)(N / tileN) * wavesPerWG;
+                    uint32_t maxWavesByLds = ldsPerWave > 0.0
+                        ? (uint32_t)std::min(16.0, std::floor(131072.0 / ldsPerWave)) : 16;
+                    rep.line("  [cR%u cC%u wg%ux%u bk%u] tile=%ux%u, LDS=%.0f B/wg (%.0f B/wave), "
+                             "waves/wg=%u, occ<=%u waves/unit, dispatched=%llu waves",
+                             cR, cC, wgW, wgH, BKc, tileM, tileN, ldsBytes, ldsPerWave,
+                             wavesPerWG, maxWavesByLds, (unsigned long long)dispatchedWaves);
 
                     Buffer bA, bB, bC, bD;
                     bool ok = makeBufDL(bA, (VkDeviceSize)M * K * inElem) &&
@@ -1520,7 +1537,7 @@ static std::string runBenchmark(const std::string &shaderDir) {
                     spec[6] = cR; spec[7] = cC; spec[8] = wgW; spec[9] = wgH;
                     memcpy(&spec[10], &alpha, 4); memcpy(&spec[11], &beta, 4);
                     uint32_t numSpec;
-                    if (tiled) { spec[12] = BK; spec[13] = localX; numSpec = 14; }   // BK then localX(id13)
+                    if (tiled) { spec[12] = BKc; spec[13] = localX; numSpec = 14; }  // BK then localX(id13)
                     else       { spec[12] = localX; numSpec = 13; }                  // localX at id12
                     VkSpecializationMapEntry ents[14];
                     for (uint32_t i = 0; i < numSpec; ++i) ents[i] = { i, (uint32_t)(i * 4), 4 };
