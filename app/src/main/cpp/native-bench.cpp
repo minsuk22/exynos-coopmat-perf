@@ -1385,15 +1385,15 @@ static std::string runBenchmark(const std::string &shaderDir) {
             }
         }
 
-        // ===================== 1024x1024x1024 matmul (WMMA GEMM) =====================
+        // ===================== 2048x2048x2048 matmul (WMMA GEMM) =====================
         // Real C = A*B at M=N=K=1024 using the cooperative-matrix GEMM shader, for
         // fp16 and int8. Device-local buffers; one matmul is tiny (~2.1 GFLOP) so
         // each timed run dispatches R back-to-back (R calibrated to ~40 ms) and the
         // throughput is the best of 3 boost-warmed runs across a small tile sweep.
         {
             rep.line("");
-            rep.line("==== 1024x1024x1024 matmul (WMMA GEMM) ====");
-            const uint32_t MM = 1024, NN = 1024, KK = 1024;
+            rep.line("==== 2048x2048x2048 matmul (WMMA GEMM) ====");
+            const uint32_t MM = 2048, NN = 2048, KK = 2048;
             const uint32_t lM = 16, lN = 16, lK = 16;
 
             auto makeBufDL = [&](Buffer &b, VkDeviceSize bytes) -> bool {
@@ -1443,7 +1443,7 @@ static std::string runBenchmark(const std::string &shaderDir) {
                         c.CType == combo.outputType && c.ResultType == combo.outputType) { have16 = true; break; }
 
                 rep.line("");
-                rep.line("---- %s*%s -> %s [matmul 1024^3] ----",
+                rep.line("---- %s*%s -> %s [matmul 2048^3] ----",
                          componentTypeName(combo.inputType), componentTypeName(combo.inputType),
                          componentTypeName(combo.outputType));
                 if (!have16) { rep.line("  no 16x16x16 subgroup shape; skip"); continue; }
@@ -1470,11 +1470,16 @@ static std::string runBenchmark(const std::string &shaderDir) {
                 // VGPR file; bigger workgroup tiles raise data reuse, but enough
                 // subgroups per workgroup keep LDS per wave <= ~1-2KB so the full
                 // 64 waves/unit stay resident. { cR, cC, WG_W, WG_H, BK }.
+                // Raising the workgroup output tile raises data reuse: the global
+                // A/B load : coopMatMulAdd ratio (tiled) is lM/TILE_M + lN/TILE_N,
+                // so a 256x256 tile gives 1/16 + 1/16 = 1/8. cR*cC controls the
+                // per-subgroup register footprint; more subgroups enlarge the tile
+                // without growing it. { cR, cC, WG_W, WG_H, BK }.
                 struct Cfg { uint32_t cR, cC, wgW, wgH, bk; };
                 const Cfg cfgs[] = {
-                    { 2, 2, 4, 4, 32 },   // TILE 128x128, 16 waves/wg, ~1KB/wave (best reuse)
-                    { 2, 2, 4, 2, 32 },   // TILE 64x128,   8 waves/wg, ~1.5KB/wave
-                    { 2, 2, 2, 2, 16 },   // TILE 64x64,     4 waves/wg, ~1KB/wave (low LDS)
+                    { 2, 2, 4, 4, 32 },   // TILE 128x128, load:MulAdd = 1/4,  4 accum
+                    { 2, 4, 4, 8, 16 },   // TILE 256x256, load:MulAdd = 1/8,  8 accum, 32 sg (>=512 waves)
+                    { 4, 4, 4, 4, 16 },   // TILE 256x256, load:MulAdd = 1/8, 16 accum (alt)
                 };
                 double bestRate = 0.0, bestMs = 0.0, bestBW = 0.0; uint32_t bTileM = 0, bTileN = 0;
 
@@ -1490,12 +1495,16 @@ static std::string runBenchmark(const std::string &shaderDir) {
                     double ldsBytes = tiled ? (double)(tileM * BKc + BKc * tileN) * (double)inElem : 0.0;
                     double ldsPerWave = wavesPerWG ? ldsBytes / wavesPerWG : 0.0;
                     uint64_t dispatchedWaves = (uint64_t)(M / tileM) * (uint64_t)(N / tileN) * wavesPerWG;
-                    uint32_t maxWavesByLds = ldsPerWave > 0.0
-                        ? (uint32_t)std::min(64.0, std::floor(131072.0 / ldsPerWave)) : 64;
-                    rep.line("  [cR%u cC%u wg%ux%u bk%u] tile=%ux%u, LDS=%.0f B/wg (%.0f B/wave), "
-                             "waves/wg=%u, occ<=%u waves/unit, dispatched=%llu waves",
-                             cR, cC, wgW, wgH, BKc, tileM, tileN, ldsBytes, ldsPerWave,
-                             wavesPerWG, maxWavesByLds, (unsigned long long)dispatchedWaves);
+                    // Matrix load : coopMatMulAdd ratio. Tiled: A/B staged once per
+                    // workgroup -> lM/TILE_M + lN/TILE_N. Simple: each subgroup
+                    // loads its own -> (cR+cC)/(cR*cC).
+                    double loadRatio = tiled ? ((double)lM / tileM + (double)lN / tileN)
+                                             : ((double)(cR + cC) / ((double)cR * cC));
+                    rep.line("  [cR%u cC%u wg%ux%u bk%u] tile=%ux%u, LDS=%.0f B/wave, waves/wg=%u, "
+                             "dispatched=%llu waves, load:MulAdd=%.3f (1/%.1f)",
+                             cR, cC, wgW, wgH, BKc, tileM, tileN, ldsPerWave, wavesPerWG,
+                             (unsigned long long)dispatchedWaves, loadRatio,
+                             loadRatio > 0.0 ? 1.0 / loadRatio : 0.0);
 
                     Buffer bA, bB, bC, bD;
                     bool ok = makeBufDL(bA, (VkDeviceSize)M * K * inElem) &&
