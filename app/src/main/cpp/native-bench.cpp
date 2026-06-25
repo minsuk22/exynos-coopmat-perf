@@ -1315,19 +1315,41 @@ static std::string runBenchmark(const std::string &shaderDir) {
                     // Run ROUNDS measurements, 1 s apart, printing each so the
                     // performance over time (DVFS / thermal) is visible.
                     rep.line("  repeats=%u (wg=%u, subgroups=%llu, compute=%.1f %s/run), "
-                             "%d rounds @ 1 s apart:",
+                             "%d rounds @ 1 s apart (boost-warmed):",
                              repeats, workgroups, (unsigned long long)totalSubgroups,
                              ops / 1e9, opUnit, ROUNDS);
-                    once();   // warmup (not printed)
+                    // Keep the GPU busy for ~burstSec to ramp it back to its boost
+                    // clock before each measured round (the 1 s idle between rounds
+                    // otherwise drops the clock and the short measured dispatch is
+                    // gone before the governor re-boosts).
+                    auto boostWarm = [&]() -> bool {
+                        double warm = 0.0;
+                        while (warm < 0.3) {           // ~300 ms of work
+                            double s = once();
+                            if (s < 0) return false;   // device-lost
+                            warm += s;
+                        }
+                        return true;
+                    };
                     for (int rnd = 0; rnd < ROUNDS; ++rnd) {
-                        double s = once();
-                        if (s < 0) {
+                        if (!boostWarm()) {
                             rep.line("    round %2d: device-lost (VkResult=-4)", rnd + 1);
                             break;
                         }
-                        double rate = ops / s / 1e12;   // TFLOPS/TOPS (2-op)
+                        // Best of 3 timed runs, all at the boosted clock.
+                        double best = 1e30; bool lost = false;
+                        for (int t = 0; t < 3; ++t) {
+                            double s = once();
+                            if (s < 0) { lost = true; break; }
+                            if (s < best) best = s;
+                        }
+                        if (lost) {
+                            rep.line("    round %2d: device-lost (VkResult=-4)", rnd + 1);
+                            break;
+                        }
+                        double rate = ops / best / 1e12;   // TFLOPS/TOPS (2-op)
                         rep.line("    round %2d: time=%.3f ms | %.2f %s (2-op) = %.2f TMAC/s",
-                                 rnd + 1, s * 1e3, rate, rateUnit, rate / 2.0);
+                                 rnd + 1, best * 1e3, rate, rateUnit, rate / 2.0);
                         if (rnd + 1 < ROUNDS)
                             std::this_thread::sleep_for(std::chrono::seconds(1));
                     }
