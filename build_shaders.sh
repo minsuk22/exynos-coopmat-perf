@@ -6,6 +6,7 @@ set -e
 GLSLANG="${GLSLANG:-glslangValidator}"
 SRC="$(dirname "$0")/shaders/gemm_coopmat.comp"
 PSRC="$(dirname "$0")/shaders/wmma_peak.comp"
+SSRC="$(dirname "$0")/shaders/gemm_shmem.comp"
 OUT="$(dirname "$0")/app/src/main/assets/shaders"
 TENV="--target-env spirv1.3"
 
@@ -20,4 +21,9 @@ mkdir -p "$OUT"
 "$GLSLANG" $TENV -DA_TYPE=float16_t -DC_TYPE=float16_t -V "$PSRC" -o "$OUT/wmma_peak_fp16_fp16.spv"
 "$GLSLANG" $TENV -DA_TYPE=int8_t    -DC_TYPE=int32_t   -V "$PSRC" -o "$OUT/wmma_peak_s8_s32.spv"
 "$GLSLANG" $TENV -DA_TYPE=uint8_t   -DC_TYPE=uint32_t  -V "$PSRC" -o "$OUT/wmma_peak_u8_u32.spv"
+# Shared-memory tiled GEMM (used by the 1024^3 matmul test).
+"$GLSLANG" $TENV -DA_TYPE=float16_t -DC_TYPE=float32_t -V "$SSRC" -o "$OUT/gemm_shmem_fp16_fp32.spv"
+"$GLSLANG" $TENV -DA_TYPE=float16_t -DC_TYPE=float16_t -V "$SSRC" -o "$OUT/gemm_shmem_fp16_fp16.spv"
+"$GLSLANG" $TENV -DA_TYPE=int8_t    -DC_TYPE=int32_t   -V "$SSRC" -o "$OUT/gemm_shmem_s8_s32.spv"
+"$GLSLANG" $TENV -DA_TYPE=uint8_t   -DC_TYPE=uint32_t  -V "$SSRC" -o "$OUT/gemm_shmem_u8_u32.spv"
 echo "Shaders written to $OUT"

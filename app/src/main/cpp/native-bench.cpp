@@ -297,16 +297,17 @@ static float halfToFloat(uint16_t h) {
 struct TypeCombo {
     VkComponentTypeKHR inputType;
     VkComponentTypeKHR outputType;
-    const char *spvFile;       // GEMM sweep shader (currently disabled)
+    const char *spvFile;       // simple GEMM (streams A/B from global)
     const char *peakSpvFile;   // WMMA peak microbenchmark shader
+    const char *shmemSpvFile;  // shared-memory tiled GEMM
     bool isFloat;
 };
 
 static const TypeCombo kCombos[] = {
-    { VK_COMPONENT_TYPE_FLOAT16_KHR, VK_COMPONENT_TYPE_FLOAT32_KHR, "gemm_fp16_fp32.spv", "wmma_peak_fp16_fp32.spv", true },
-    { VK_COMPONENT_TYPE_FLOAT16_KHR, VK_COMPONENT_TYPE_FLOAT16_KHR, "gemm_fp16_fp16.spv", "wmma_peak_fp16_fp16.spv", true },
-    { VK_COMPONENT_TYPE_SINT8_KHR,   VK_COMPONENT_TYPE_SINT32_KHR,  "gemm_s8_s32.spv",   "wmma_peak_s8_s32.spv",   false },
-    { VK_COMPONENT_TYPE_UINT8_KHR,   VK_COMPONENT_TYPE_UINT32_KHR,  "gemm_u8_u32.spv",   "wmma_peak_u8_u32.spv",   false },
+    { VK_COMPONENT_TYPE_FLOAT16_KHR, VK_COMPONENT_TYPE_FLOAT32_KHR, "gemm_fp16_fp32.spv", "wmma_peak_fp16_fp32.spv", "gemm_shmem_fp16_fp32.spv", true },
+    { VK_COMPONENT_TYPE_FLOAT16_KHR, VK_COMPONENT_TYPE_FLOAT16_KHR, "gemm_fp16_fp16.spv", "wmma_peak_fp16_fp16.spv", "gemm_shmem_fp16_fp16.spv", true },
+    { VK_COMPONENT_TYPE_SINT8_KHR,   VK_COMPONENT_TYPE_SINT32_KHR,  "gemm_s8_s32.spv",   "wmma_peak_s8_s32.spv",   "gemm_shmem_s8_s32.spv",   false },
+    { VK_COMPONENT_TYPE_UINT8_KHR,   VK_COMPONENT_TYPE_UINT32_KHR,  "gemm_u8_u32.spv",   "wmma_peak_u8_u32.spv",   "gemm_shmem_u8_u32.spv",   false },
 };
 
 static int32_t findMemoryType(const VkPhysicalDeviceMemoryProperties &mp,
@@ -1428,7 +1429,12 @@ static std::string runBenchmark(const std::string &shaderDir) {
                 b = Buffer{};
             };
 
-            for (const auto &combo : kCombos) {
+            auto benchGemm = [&](bool tiled) {
+              const uint32_t BK = 32;   // K-block staged in shared memory (tiled)
+              rep.line("");
+              rep.line(tiled ? "########## shared-memory tiled GEMM ##########"
+                             : "########## simple GEMM (streams A/B from global) ##########");
+              for (const auto &combo : kCombos) {
                 if (combo.isFloat && !canFloat) continue;
                 if (!combo.isFloat && !canInt) continue;
                 bool have16 = false;
@@ -1443,7 +1449,7 @@ static std::string runBenchmark(const std::string &shaderDir) {
                          componentTypeName(combo.outputType));
                 if (!have16) { rep.line("  no 16x16x16 subgroup shape; skip"); continue; }
 
-                std::string path = shaderDir + "/" + combo.spvFile;
+                std::string path = shaderDir + "/" + (tiled ? combo.shmemSpvFile : combo.spvFile);
                 std::ifstream f(path, std::ios::binary | std::ios::ate);
                 if (!f) { rep.line("  shader not found: %s", path.c_str()); continue; }
                 std::streamsize sz = f.tellg(); f.seekg(0);
@@ -1471,7 +1477,7 @@ static std::string runBenchmark(const std::string &shaderDir) {
                     uint32_t cR = cfg.cR, cC = cfg.cC;
                     uint32_t tileM = wgH * cR * lM, tileN = wgW * cC * lN, localX = wgW * wgH * reqSg;
                     auto rup = [](uint32_t v, uint32_t a) { return (v + a - 1) / a * a; };
-                    uint32_t M = rup(MM, tileM), N = rup(NN, tileN), K = rup(KK, lK);
+                    uint32_t M = rup(MM, tileM), N = rup(NN, tileN), K = rup(KK, tiled ? BK : lK);
 
                     Buffer bA, bB, bC, bD;
                     bool ok = makeBufDL(bA, (VkDeviceSize)M * K * inElem) &&
@@ -1509,13 +1515,16 @@ static std::string runBenchmark(const std::string &shaderDir) {
                     vkUpdateDescriptorSets(device, 4, wds, 0, nullptr);
 
                     float alpha = 1.0f, beta = 0.0f;
-                    uint32_t spec[13];
+                    uint32_t spec[14];
                     spec[0] = lM; spec[1] = lN; spec[2] = lK; spec[3] = M; spec[4] = N; spec[5] = K;
                     spec[6] = cR; spec[7] = cC; spec[8] = wgW; spec[9] = wgH;
-                    memcpy(&spec[10], &alpha, 4); memcpy(&spec[11], &beta, 4); spec[12] = localX;
-                    VkSpecializationMapEntry ents[13];
-                    for (uint32_t i = 0; i < 13; ++i) ents[i] = { i, (uint32_t)(i * 4), 4 };
-                    VkSpecializationInfo spi = { 13, ents, sizeof(spec), spec };
+                    memcpy(&spec[10], &alpha, 4); memcpy(&spec[11], &beta, 4);
+                    uint32_t numSpec;
+                    if (tiled) { spec[12] = BK; spec[13] = localX; numSpec = 14; }   // BK then localX(id13)
+                    else       { spec[12] = localX; numSpec = 13; }                  // localX at id12
+                    VkSpecializationMapEntry ents[14];
+                    for (uint32_t i = 0; i < numSpec; ++i) ents[i] = { i, (uint32_t)(i * 4), 4 };
+                    VkSpecializationInfo spi = { numSpec, ents, (size_t)numSpec * 4, spec };
                     VkPipelineShaderStageRequiredSubgroupSizeCreateInfo rss = {
                         VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO };
                     rss.requiredSubgroupSize = reqSg;
@@ -1581,7 +1590,10 @@ static std::string runBenchmark(const std::string &shaderDir) {
                     rep.line("  BEST: tile %ux%u  %.4f ms/matmul | %.2f %s = %.2f TMAC/s "
                              "| min DRAM BW=%.1f GB/s",
                              bTileM, bTileN, bestMs, bestRate, rateUnit, bestRate / 2.0, bestBW);
-            }
+              }
+            };
+            benchGemm(false);   // simple GEMM (global streaming)
+            benchGemm(true);    // shared-memory tiled GEMM
         }
 
         vkDestroyCommandPool(device, cmdPool, nullptr);
