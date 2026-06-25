@@ -1286,6 +1286,7 @@ static std::string runBenchmark(const std::string &shaderDir) {
 
                 const char *opUnit   = combo.isFloat ? "GFLOP"  : "GOP";
                 const char *rateUnit = combo.isFloat ? "TFLOPS" : "TOPS";
+                bool dumpedExec = false;   // dump GPU ISA once per type
 
                 for (uint32_t repeats : repeatCounts) {
                     // Scale the launch so subgroups*repeats ~= WORK_BUDGET, keeping
@@ -1311,9 +1312,19 @@ static std::string runBenchmark(const std::string &shaderDir) {
                     ssci.module = module; ssci.pName = "main"; ssci.pSpecializationInfo = &spi;
                     VkComputePipelineCreateInfo cpci2 = { VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
                     cpci2.stage = ssci; cpci2.layout = pipelineLayout;
+                    // Ask the driver to keep the compiled GPU executable so we can
+                    // dump its ISA (sp3) and statistics, once per type.
+                    if (wantPipeExec && !dumpedExec)
+                        cpci2.flags |= VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR |
+                                       VK_PIPELINE_CREATE_CAPTURE_INTERNAL_REPRESENTATIONS_BIT_KHR;
                     VkPipeline pipeline;
                     if (vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &cpci2, nullptr, &pipeline) != VK_SUCCESS) {
                         rep.line("  repeats=%u: pipeline create failed", repeats); continue;
+                    }
+                    if (wantPipeExec && !dumpedExec) {
+                        rep.line("  -- compiled GPU executable (ISA / sp3, statistics) --");
+                        dumpPipelineExecutables(device, pipeline, rep, pfnPeProps, pfnPeStats, pfnPeIR);
+                        dumpedExec = true;
                     }
 
                     VkCommandBufferBeginInfo bi = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
