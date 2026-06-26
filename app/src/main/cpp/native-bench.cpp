@@ -186,6 +186,21 @@ typedef VkResult (VKAPI_PTR *PFN_vkGetPipelineExecutableInternalRepresentationsK
     VkDevice, const VkPipelineExecutableInfoKHR*, uint32_t*, VkPipelineExecutableInternalRepresentationKHR*);
 #endif // VK_KHR_pipeline_executable_properties
 
+// ---------------------------------------------------------------------------
+// Fallback for VK_KHR_shader_integer_dot_product (dp4a), used by the optimized
+// FMA int8 GEMM. Core in Vulkan 1.3; newer NDKs define it.
+// ---------------------------------------------------------------------------
+#if !defined(VK_KHR_shader_integer_dot_product)
+#define VK_KHR_shader_integer_dot_product 1
+#define VK_KHR_SHADER_INTEGER_DOT_PRODUCT_EXTENSION_NAME "VK_KHR_shader_integer_dot_product"
+#define VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_INTEGER_DOT_PRODUCT_FEATURES ((VkStructureType)1000280000)
+typedef struct VkPhysicalDeviceShaderIntegerDotProductFeatures {
+    VkStructureType sType;
+    void* pNext;
+    VkBool32 shaderIntegerDotProduct;
+} VkPhysicalDeviceShaderIntegerDotProductFeatures;
+#endif // VK_KHR_shader_integer_dot_product
+
 #define ARRAY_LENGTH(x) (sizeof(x) / sizeof((x)[0]))
 
 // ---------------------------------------------------------------------------
@@ -305,10 +320,10 @@ struct TypeCombo {
 };
 
 static const TypeCombo kCombos[] = {
-    { VK_COMPONENT_TYPE_FLOAT16_KHR, VK_COMPONENT_TYPE_FLOAT32_KHR, "gemm_fp16_fp32.spv", "wmma_peak_fp16_fp32.spv", "gemm_shmem_fp16_fp32.spv", "fma_gemm_fp16_fp32.spv", true },
-    { VK_COMPONENT_TYPE_FLOAT16_KHR, VK_COMPONENT_TYPE_FLOAT16_KHR, "gemm_fp16_fp16.spv", "wmma_peak_fp16_fp16.spv", "gemm_shmem_fp16_fp16.spv", "fma_gemm_fp16_fp16.spv", true },
-    { VK_COMPONENT_TYPE_SINT8_KHR,   VK_COMPONENT_TYPE_SINT32_KHR,  "gemm_s8_s32.spv",   "wmma_peak_s8_s32.spv",   "gemm_shmem_s8_s32.spv",   "fma_gemm_s8_s32.spv",   false },
-    { VK_COMPONENT_TYPE_UINT8_KHR,   VK_COMPONENT_TYPE_UINT32_KHR,  "gemm_u8_u32.spv",   "wmma_peak_u8_u32.spv",   "gemm_shmem_u8_u32.spv",   "fma_gemm_u8_u32.spv",   false },
+    { VK_COMPONENT_TYPE_FLOAT16_KHR, VK_COMPONENT_TYPE_FLOAT32_KHR, "gemm_fp16_fp32.spv", "wmma_peak_fp16_fp32.spv", "gemm_shmem_fp16_fp32.spv", "fma_opt_fp16_fp32.spv", true },
+    { VK_COMPONENT_TYPE_FLOAT16_KHR, VK_COMPONENT_TYPE_FLOAT16_KHR, "gemm_fp16_fp16.spv", "wmma_peak_fp16_fp16.spv", "gemm_shmem_fp16_fp16.spv", "fma_opt_fp16_fp16.spv", true },
+    { VK_COMPONENT_TYPE_SINT8_KHR,   VK_COMPONENT_TYPE_SINT32_KHR,  "gemm_s8_s32.spv",   "wmma_peak_s8_s32.spv",   "gemm_shmem_s8_s32.spv",   "fma_opt_s8_s32.spv",   false },
+    { VK_COMPONENT_TYPE_UINT8_KHR,   VK_COMPONENT_TYPE_UINT32_KHR,  "gemm_u8_u32.spv",   "wmma_peak_u8_u32.spv",   "gemm_shmem_u8_u32.spv",   "fma_opt_u8_u32.spv",   false },
 };
 
 static int32_t findMemoryType(const VkPhysicalDeviceMemoryProperties &mp,
@@ -674,9 +689,12 @@ static std::string runBenchmark(const std::string &shaderDir) {
             VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_8BIT_STORAGE_FEATURES, &f16Store };
         VkPhysicalDeviceSubgroupSizeControlFeatures fSgsc = {
             VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_FEATURES, &f8Store };
+        VkPhysicalDeviceShaderIntegerDotProductFeatures fIDot = {
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_INTEGER_DOT_PRODUCT_FEATURES, &fSgsc };
         VkPhysicalDeviceFeatures2 feats2 = {
-            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &fSgsc };
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &fIDot };
         if (pfnGetFeats2) pfnGetFeats2(pd, &feats2);
+        bool hasIntDot = fIDot.shaderIntegerDotProduct;
 
         rep.line("");
         rep.line("Required feature support:");
@@ -752,6 +770,24 @@ static std::string runBenchmark(const std::string &shaderDir) {
             fSgsc.pNext = &fPipeExecEn;
             devExts.push_back(VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME);
         }
+
+        // Enable integer dot product (dp4a) for the optimized int8 FMA GEMM.
+        VkPhysicalDeviceShaderIntegerDotProductFeatures fIDotEn = {
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_INTEGER_DOT_PRODUCT_FEATURES };
+        if (hasIntDot) {
+            fIDotEn.shaderIntegerDotProduct = VK_TRUE;
+            if (wantPipeExec) fPipeExecEn.pNext = &fIDotEn;
+            else fSgsc.pNext = &fIDotEn;
+            bool hasIDotExt = false;
+            uint32_t ne = 0;
+            vkEnumerateDeviceExtensionProperties(pd, nullptr, &ne, nullptr);
+            std::vector<VkExtensionProperties> ex(ne);
+            vkEnumerateDeviceExtensionProperties(pd, nullptr, &ne, ex.data());
+            for (auto &e : ex)
+                if (strcmp(e.extensionName, VK_KHR_SHADER_INTEGER_DOT_PRODUCT_EXTENSION_NAME) == 0) hasIDotExt = true;
+            if (hasIDotExt) devExts.push_back(VK_KHR_SHADER_INTEGER_DOT_PRODUCT_EXTENSION_NAME);
+        }
+        rep.line("  shaderIntegerDotProduct (dp4a) = %u", hasIntDot);
 
         float prio = 1.0f;
         VkDeviceQueueCreateInfo qci = { VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO };
@@ -1204,6 +1240,7 @@ static std::string runBenchmark(const std::string &shaderDir) {
         // subgroup loads one shared 16x16 A/B tile (cache/register resident) and
         // repeats NACC cross-fed MulAdds REPEATS times, for REPEATS in
         // {1024, 4096, 8196}. Data is generated per operation type.
+#if 0   // ===== WMMA peak test DISABLED (only the optimized FMA GEMM runs) =====
         {
             rep.line("");
             rep.line("==== WMMA peak throughput (16x16 tile loaded once, repeated MulAdd) ====");
@@ -1426,6 +1463,7 @@ static std::string runBenchmark(const std::string &shaderDir) {
                 vkDestroyShaderModule(device, module, nullptr);
             }
         }
+#endif  // ===== end disabled WMMA peak test =====
 
         // ===================== 2048x2048x2048 matmul (WMMA GEMM) =====================
         // Real C = A*B at M=N=K=1024 using the cooperative-matrix GEMM shader, for
@@ -1679,9 +1717,13 @@ static std::string runBenchmark(const std::string &shaderDir) {
                     if (combo.isFloat && !canFloat) continue;
                     if (!combo.isFloat && !canInt) continue;
                     rep.line("");
-                    rep.line("---- %s*%s -> %s [FMA matmul 2048^3] ----",
+                    rep.line("---- %s*%s -> %s [optimized FMA matmul 2048^3] ----",
                              componentTypeName(combo.inputType), componentTypeName(combo.inputType),
                              componentTypeName(combo.outputType));
+                    // Show the shader source for this data type.
+                    dumpTypedShaderSource(shaderDir, "fma_gemm_opt.comp",
+                                          glslTypeName(combo.inputType),
+                                          glslTypeName(combo.outputType), rep);
                     std::string path = shaderDir + "/" + combo.fmaSpvFile;
                     std::ifstream f(path, std::ios::binary | std::ios::ate);
                     if (!f) { rep.line("  shader not found: %s", path.c_str()); continue; }
@@ -1696,6 +1738,7 @@ static std::string runBenchmark(const std::string &shaderDir) {
                     size_t outElem = componentBits(combo.outputType) / 8;
                     const char *rateUnit = combo.isFloat ? "TFLOPS" : "TOPS";
                     double bestRate = 0.0, bestMs = 0.0, bestBW = 0.0; uint32_t bBM = 0, bBN = 0;
+                    bool dumpedIsa = false;   // dump the GPU ISA (sp3) once per type
 
                     for (const auto &cfg : cfgs) {
                         uint32_t BM = cfg.BM, BN = cfg.BN, BK = cfg.BK, TM = cfg.TM, TN = cfg.TN;
@@ -1729,14 +1772,23 @@ static std::string runBenchmark(const std::string &shaderDir) {
                         ssci.stage = VK_SHADER_STAGE_COMPUTE_BIT; ssci.module = module; ssci.pName = "main"; ssci.pSpecializationInfo = &spi;
                         VkComputePipelineCreateInfo cpci2 = { VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
                         cpci2.stage = ssci; cpci2.layout = pipelineLayout;
-                        if (wantPipeExec) cpci2.flags |= VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR;
+                        if (wantPipeExec) cpci2.flags |= VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR |
+                                                          VK_PIPELINE_CREATE_CAPTURE_INTERNAL_REPRESENTATIONS_BIT_KHR;
                         VkPipeline pipeline;
                         if (vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &cpci2, nullptr, &pipeline) != VK_SUCCESS) {
                             rep.line("  [BM%u BN%u BK%u TM%u TN%u] pipeline create failed", BM, BN, BK, TM, TN);
                             freeBufDL(bA); freeBufDL(bB); freeBufDL(bC); freeBufDL(bD); continue;
                         }
                         rep.line("  [BM%u BN%u BK%u TM%u TN%u] threads/wg=%u", BM, BN, BK, TM, TN, localX);
-                        if (wantPipeExec) dumpPipelineStatsOnly(device, pipeline, rep, "stat", pfnPeProps, pfnPeStats);
+                        if (wantPipeExec) {
+                            if (!dumpedIsa) {   // full ISA (sp3) once per type
+                                rep.line("    -- compiled GPU executable (ISA / sp3, statistics) --");
+                                dumpPipelineExecutables(device, pipeline, rep, pfnPeProps, pfnPeStats, pfnPeIR);
+                                dumpedIsa = true;
+                            } else {
+                                dumpPipelineStatsOnly(device, pipeline, rep, "stat", pfnPeProps, pfnPeStats);
+                            }
+                        }
 
                         uint32_t gx = N / BN, gy = M / BM;
                         VkResult wr = VK_SUCCESS;
@@ -1768,9 +1820,10 @@ static std::string runBenchmark(const std::string &shaderDir) {
                 }
             };
 
-            benchGemm(false);   // simple WMMA GEMM (global streaming)
-            benchGemm(true);    // shared-memory tiled WMMA GEMM
-            benchFma();         // FMA/MAD GEMM (no WMMA)
+            // benchGemm(false);   // simple WMMA GEMM   (disabled)
+            // benchGemm(true);    // tiled WMMA GEMM    (disabled)
+            (void)benchGemm;       // keep lambda referenced (avoids unused warning)
+            benchFma();            // optimized FMA/MAD GEMM (no WMMA) -- the active test
         }
 
         vkDestroyCommandPool(device, cmdPool, nullptr);

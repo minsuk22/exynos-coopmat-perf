@@ -1,0 +1,98 @@
+/*
+ * Optimized FMA/MAD GEMM (NO WMMA) using packed dot products.
+ *
+ * - int8/uint8: GL_EXT_integer_dot_product (dp4a) -- 4 int8 MACs per instruction.
+ * - float16  : packed f16vec4 dot -- 4 fp16 MACs per packed op.
+ *
+ * Each thread computes a TM x TN micro-tile. A and B are staged into shared
+ * memory with the K dimension packed 4-wide (vec4); B is stored TRANSPOSED so a
+ * column's 4 K-values are contiguous, letting both operands feed one dot/dp4a.
+ *
+ * Compile-time defines:
+ *   A_TYPE   = float16_t | int8_t | uint8_t
+ *   C_TYPE   = float32_t | float16_t | int32_t | uint32_t
+ *   VEC_TYPE = f16vec4 | i8vec4 | u8vec4   (4 packed along K)
+ *   IS_INT   = defined for the integer (dp4a) path
+ */
+#version 450 core
+#extension GL_EXT_shader_explicit_arithmetic_types : enable
+#extension GL_EXT_control_flow_attributes : enable
+#ifdef IS_INT
+#extension GL_EXT_integer_dot_product : enable
+#endif
+
+layout(constant_id = 0) const uint M  = 2048;
+layout(constant_id = 1) const uint N  = 2048;
+layout(constant_id = 2) const uint K  = 2048;
+layout(constant_id = 3) const uint BM = 64;
+layout(constant_id = 4) const uint BN = 64;
+layout(constant_id = 5) const uint BK = 16;   // must be a multiple of 4
+layout(constant_id = 6) const uint TM = 4;
+layout(constant_id = 7) const uint TN = 4;
+layout(local_size_x_id = 8, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly  buffer BufA { A_TYPE a[]; };
+layout(set = 0, binding = 1) readonly  buffer BufB { A_TYPE b[]; };
+layout(set = 0, binding = 2) readonly  buffer BufC { C_TYPE c[]; };
+layout(set = 0, binding = 3) writeonly buffer BufD { C_TYPE d[]; };
+
+const uint KC = BK / 4u;                 // vec4 chunks along K
+shared VEC_TYPE As[BM * (BK / 4u)];      // BM rows   x KC  (row-major, K packed)
+shared VEC_TYPE Bs[BN * (BK / 4u)];      // BN cols   x KC  (B transposed, K packed)
+
+void main()
+{
+    uint nthreads = gl_WorkGroupSize.x;
+    uint tid      = gl_LocalInvocationID.x;
+    uint threadsX = BN / TN;
+    uint tx       = tid % threadsX;
+    uint ty       = tid / threadsX;
+    uint rowBase  = gl_WorkGroupID.y * BM;
+    uint colBase  = gl_WorkGroupID.x * BN;
+
+    C_TYPE acc[TM][TN];
+    [[unroll]] for (uint i = 0; i < TM; ++i)
+        [[unroll]] for (uint j = 0; j < TN; ++j) acc[i][j] = C_TYPE(0);
+
+    for (uint k0 = 0; k0 < K; k0 += BK) {
+        barrier();
+        // Stage A (BM x BK), K packed 4-wide.
+        for (uint idx = tid; idx < BM * KC; idx += nthreads) {
+            uint i = idx / KC, kc = idx % KC;
+            uint base = (rowBase + i) * K + k0 + kc * 4u;
+            As[idx] = VEC_TYPE(a[base], a[base + 1u], a[base + 2u], a[base + 3u]);
+        }
+        // Stage B (BK x BN) TRANSPOSED -> Bs[col][kc] holds 4 K-consecutive values.
+        for (uint idx = tid; idx < BN * KC; idx += nthreads) {
+            uint j = idx / KC, kc = idx % KC;
+            uint bk = k0 + kc * 4u, cj = colBase + j;
+            Bs[idx] = VEC_TYPE(b[bk * N + cj], b[(bk + 1u) * N + cj],
+                               b[(bk + 2u) * N + cj], b[(bk + 3u) * N + cj]);
+        }
+        barrier();
+
+        [[unroll]] for (uint kc = 0; kc < KC; ++kc) {
+            VEC_TYPE av[TM];
+            VEC_TYPE bv[TN];
+            [[unroll]] for (uint i = 0; i < TM; ++i) av[i] = As[(ty * TM + i) * KC + kc];
+            [[unroll]] for (uint j = 0; j < TN; ++j) bv[j] = Bs[(tx * TN + j) * KC + kc];
+            [[unroll]] for (uint i = 0; i < TM; ++i) {
+                [[unroll]] for (uint j = 0; j < TN; ++j) {
+#ifdef IS_INT
+                    acc[i][j] += dotEXT(av[i], bv[j]);          // dp4a: 4 int8 MACs
+#else
+                    acc[i][j] += C_TYPE(dot(av[i], bv[j]));      // packed fp16 dot: 4 MACs
+#endif
+                }
+            }
+        }
+    }
+
+    [[unroll]] for (uint i = 0; i < TM; ++i) {
+        uint gi = rowBase + ty * TM + i;
+        [[unroll]] for (uint j = 0; j < TN; ++j) {
+            uint gj = colBase + tx * TN + j;
+            d[gi * N + gj] = acc[i][j];
+        }
+    }
+}
