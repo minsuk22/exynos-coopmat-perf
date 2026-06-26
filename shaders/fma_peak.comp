@@ -1,0 +1,52 @@
+/*
+ * Pure FMA/MAD peak microbenchmark (NO WMMA) -- the ALU counterpart of
+ * wmma_peak.comp. Each thread keeps NVEC independent vec4 accumulators in
+ * registers and hammers them with cross-fed multiply-adds for REPEATS
+ * iterations. No memory traffic in the loop, so it measures the vector ALU's
+ * peak multiply-add throughput, to compare against the WMMA (matrix-unit) peak.
+ *
+ * Folding guard: operands are seeded from the invocation id (runtime, not
+ * constant) and the accumulators are cross-fed (acc[i] uses acc[(i+1)]), so the
+ * loop is a coupled recurrence the compiler cannot fold to a closed form, and
+ * the multiplicand varies each iteration (a real FMA, not a hoisted add).
+ *
+ * ops = 2 * (NVEC*4) * REPEATS * totalThreads.
+ *
+ * Defines: C_TYPE (accumulator), VACC (vec4 of C_TYPE), IS_INT for the int path.
+ */
+#version 450 core
+#extension GL_EXT_shader_explicit_arithmetic_types : enable
+#extension GL_EXT_control_flow_attributes : enable
+
+layout(constant_id = 0) const uint REPEATS = 1024;
+layout(constant_id = 1) const uint NVEC = 8;     // independent vec4 accumulators (ILP)
+layout(local_size_x_id = 2, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly  buffer BufA { C_TYPE a[]; };   // unused
+layout(set = 0, binding = 1) readonly  buffer BufB { C_TYPE b[]; };   // unused
+layout(set = 0, binding = 2) readonly  buffer BufC { C_TYPE c[]; };   // unused
+layout(set = 0, binding = 3) writeonly buffer BufD { C_TYPE d[]; };   // sink
+
+void main()
+{
+    uint gid = gl_GlobalInvocationID.x;
+    VACC av = VACC(C_TYPE(gid + 1u));
+    VACC bv = VACC(C_TYPE(gid % 3u + 1u));   // runtime multiplicand (no strength-reduce)
+
+    VACC acc[16];
+    [[unroll]] for (uint i = 0; i < NVEC; ++i) acc[i] = VACC(C_TYPE(i + 1u));
+
+    for (uint r = 0; r < REPEATS; ++r) {
+        [[unroll]] for (uint i = 0; i < NVEC; ++i) {
+#ifdef IS_INT
+            acc[i] = acc[(i + 1u) % NVEC] * bv + av;        // integer MAD
+#else
+            acc[i] = fma(acc[(i + 1u) % NVEC], bv, av);      // float FMA
+#endif
+        }
+    }
+
+    VACC s = acc[0];
+    [[unroll]] for (uint i = 1; i < NVEC; ++i) s += acc[i];
+    d[gid] = s.x + s.y + s.z + s.w;
+}

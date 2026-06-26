@@ -1840,8 +1840,141 @@ static std::string runBenchmark(const std::string &shaderDir) {
             };
 
             // benchGemm(false); benchGemm(true);   // WMMA GEMM (disabled)
-            (void)benchGemm;       // WMMA path kept but not run (avoids unused warning)
-            benchFma();            // v06-style FMA GEMM (no WMMA) -- the active test
+            // benchFma();                          // v06 FMA GEMM (disabled)
+            (void)benchGemm; (void)benchFma;        // kept but not run
+        }
+
+        // ===================== Pure FMA peak (ALU) vs WMMA peak =====================
+        // Same "repeat a compute op REPEATS times in registers" workload as the
+        // WMMA peak test, but using vector FMA/MAD instead of cooperative matrix,
+        // so the pure-compute throughput of the ALU can be compared to the matrix
+        // unit. No memory in the loop; cross-fed accumulators prevent folding.
+        {
+            rep.line("");
+            rep.line("==== Pure FMA/MAD peak (no WMMA) ====");
+            const uint32_t REPEATS = 1024;     // same repeat count as the WMMA peak
+            const uint32_t NVEC = 8;           // vec4 accumulators per thread (ILP)
+            const uint32_t SG_PER_WG = 4;
+            const uint32_t WORKGROUPS = 512;   // 512*4 = 2048 waves (>=512)
+            uint32_t localX = reqSg * SG_PER_WG;
+            uint64_t totalThreads = (uint64_t)WORKGROUPS * localX;
+            rep.line("config: workgroups=%u, localX=%u, waves=%llu, NVEC=%u, REPEATS=%u",
+                     WORKGROUPS, localX, (unsigned long long)(WORKGROUPS * SG_PER_WG), NVEC, REPEATS);
+
+            struct Pk { const char *suffix; VkComponentTypeKHR ot; bool isFloat; };
+            const Pk pks[] = {
+                { "fp16_fp32", VK_COMPONENT_TYPE_FLOAT32_KHR, true },
+                { "fp16_fp16", VK_COMPONENT_TYPE_FLOAT16_KHR, true },
+                { "s8_s32",    VK_COMPONENT_TYPE_SINT32_KHR,  false },
+            };
+
+            auto makeHV = [&](Buffer &b, VkDeviceSize bytes) -> bool {
+                b.size = bytes;
+                VkBufferCreateInfo bci = { VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
+                bci.size = bytes; bci.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+                bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+                if (vkCreateBuffer(device, &bci, nullptr, &b.dev) != VK_SUCCESS) return false;
+                VkMemoryRequirements mr; vkGetBufferMemoryRequirements(device, b.dev, &mr);
+                int32_t mi = findMemoryType(memProps, mr.memoryTypeBits,
+                    VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+                if (mi < 0) return false;
+                VkMemoryAllocateInfo mai = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
+                mai.allocationSize = mr.size; mai.memoryTypeIndex = (uint32_t)mi;
+                if (vkAllocateMemory(device, &mai, nullptr, &b.devMem) != VK_SUCCESS) return false;
+                vkBindBufferMemory(device, b.dev, b.devMem, 0);
+                return true;
+            };
+            auto freeHV = [&](Buffer &b) {
+                if (b.dev) vkDestroyBuffer(device, b.dev, nullptr);
+                if (b.devMem) vkFreeMemory(device, b.devMem, nullptr);
+                b = Buffer{};
+            };
+
+            for (const auto &pk : pks) {
+                size_t outElem = componentBits(pk.ot) / 8;
+                const char *rateUnit = pk.isFloat ? "TFLOPS" : "TOPS";
+                rep.line("");
+                rep.line("---- %s [FMA peak] ----", pk.suffix);
+                dumpTypedShaderSource(shaderDir, "fma_peak.comp", "(see VACC)", glslTypeName(pk.ot), rep);
+
+                std::string path = shaderDir + "/fma_peak_" + pk.suffix + ".spv";
+                std::ifstream f(path, std::ios::binary | std::ios::ate);
+                if (!f) { rep.line("  shader not found: %s", path.c_str()); continue; }
+                std::streamsize sz = f.tellg(); f.seekg(0);
+                std::vector<char> spv(sz); f.read(spv.data(), sz);
+                VkShaderModuleCreateInfo smci = { VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO };
+                smci.codeSize = (size_t)sz; smci.pCode = (const uint32_t *)spv.data();
+                VkShaderModule module;
+                if (vkCreateShaderModule(device, &smci, nullptr, &module) != VK_SUCCESS) { rep.line("  module create failed"); continue; }
+
+                Buffer buf;   // one buffer bound to all 4 slots; D sink = totalThreads elems
+                if (!makeHV(buf, (VkDeviceSize)totalThreads * outElem)) { rep.line("  alloc failed"); vkDestroyShaderModule(device, module, nullptr); continue; }
+                VkDescriptorBufferInfo dbi[4];
+                VkWriteDescriptorSet wds[4];
+                for (int i = 0; i < 4; ++i) {
+                    dbi[i] = { buf.dev, 0, VK_WHOLE_SIZE };
+                    wds[i] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
+                    wds[i].dstSet = descSet; wds[i].dstBinding = (uint32_t)i; wds[i].descriptorCount = 1;
+                    wds[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; wds[i].pBufferInfo = &dbi[i];
+                }
+                vkUpdateDescriptorSets(device, 4, wds, 0, nullptr);
+
+                uint32_t spec[3] = { REPEATS, NVEC, localX };
+                VkSpecializationMapEntry ents[3]; for (uint32_t i = 0; i < 3; ++i) ents[i] = { i, (uint32_t)(i * 4), 4 };
+                VkSpecializationInfo spi = { 3, ents, sizeof(spec), spec };
+                VkPipelineShaderStageCreateInfo ssci = { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO };
+                ssci.stage = VK_SHADER_STAGE_COMPUTE_BIT; ssci.module = module; ssci.pName = "main"; ssci.pSpecializationInfo = &spi;
+                VkComputePipelineCreateInfo cpci2 = { VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
+                cpci2.stage = ssci; cpci2.layout = pipelineLayout;
+                if (wantPipeExec) cpci2.flags |= VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR |
+                                                 VK_PIPELINE_CREATE_CAPTURE_INTERNAL_REPRESENTATIONS_BIT_KHR;
+                VkPipeline pipeline;
+                if (vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &cpci2, nullptr, &pipeline) != VK_SUCCESS) {
+                    rep.line("  pipeline create failed"); freeHV(buf); vkDestroyShaderModule(device, module, nullptr); continue;
+                }
+                if (wantPipeExec) {
+                    rep.line("    -- compiled GPU executable (ISA / sp3, statistics) --");
+                    dumpPipelineExecutables(device, pipeline, rep, pfnPeProps, pfnPeStats, pfnPeIR);
+                }
+
+                VkCommandBufferBeginInfo bi = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+                VkSubmitInfo si = { VK_STRUCTURE_TYPE_SUBMIT_INFO }; si.commandBufferCount = 1; si.pCommandBuffers = &cmd;
+                VkResult wr = VK_SUCCESS;
+                auto recordR = [&](uint32_t R) {
+                    vkBeginCommandBuffer(cmd, &bi);
+                    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayout, 0, 1, &descSet, 0, nullptr);
+                    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
+                    for (uint32_t i = 0; i < R; ++i) vkCmdDispatch(cmd, WORKGROUPS, 1, 1);
+                    vkEndCommandBuffer(cmd);
+                };
+                auto timed = [&]() -> double {
+                    auto a = std::chrono::high_resolution_clock::now();
+                    vkQueueSubmit(queue, 1, &si, VK_NULL_HANDLE);
+                    wr = vkQueueWaitIdle(queue);
+                    auto b = std::chrono::high_resolution_clock::now();
+                    if (wr != VK_SUCCESS) return -1.0;
+                    return std::chrono::duration<double>(b - a).count();
+                };
+                recordR(1); timed(); double t1 = timed();
+                bool lost = (t1 < 0);
+                uint32_t R = lost ? 1 : (uint32_t)std::max(1.0, 0.04 / t1); if (R > 4000) R = 4000;
+                double best = 1e30;
+                if (!lost) {
+                    recordR(R);
+                    double w = 0.0; while (w < 0.2) { double s = timed(); if (s < 0) { lost = true; break; } w += s; }
+                    for (int t = 0; !lost && t < 3; ++t) { double s = timed(); if (s < 0) { lost = true; break; } if (s < best) best = s; }
+                }
+                vkDestroyPipeline(device, pipeline, nullptr);
+                if (!lost) {
+                    double macs = 4.0 * (double)NVEC * (double)REPEATS * (double)totalThreads * (double)R;
+                    double ops = 2.0 * macs;
+                    double rate = ops / best / 1e12;
+                    rep.line("    R=%u: time=%.3f ms | compute=%.1f G%s | %.2f %s = %.2f TMAC/s",
+                             R, best * 1e3, ops / 1e9, pk.isFloat ? "FLOP" : "OP", rate, rateUnit, rate / 2.0);
+                } else rep.line("    device-lost");
+                freeHV(buf);
+                vkDestroyShaderModule(device, module, nullptr);
+            }
         }
 
         vkDestroyCommandPool(device, cmdPool, nullptr);
