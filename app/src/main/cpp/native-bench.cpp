@@ -320,10 +320,10 @@ struct TypeCombo {
 };
 
 static const TypeCombo kCombos[] = {
-    { VK_COMPONENT_TYPE_FLOAT16_KHR, VK_COMPONENT_TYPE_FLOAT32_KHR, "gemm_fp16_fp32.spv", "wmma_peak_fp16_fp32.spv", "gemm_shmem_fp16_fp32.spv", "fma_opt_fp16_fp32.spv", true },
-    { VK_COMPONENT_TYPE_FLOAT16_KHR, VK_COMPONENT_TYPE_FLOAT16_KHR, "gemm_fp16_fp16.spv", "wmma_peak_fp16_fp16.spv", "gemm_shmem_fp16_fp16.spv", "fma_opt_fp16_fp16.spv", true },
-    { VK_COMPONENT_TYPE_SINT8_KHR,   VK_COMPONENT_TYPE_SINT32_KHR,  "gemm_s8_s32.spv",   "wmma_peak_s8_s32.spv",   "gemm_shmem_s8_s32.spv",   "fma_opt_s8_s32.spv",   false },
-    { VK_COMPONENT_TYPE_UINT8_KHR,   VK_COMPONENT_TYPE_UINT32_KHR,  "gemm_u8_u32.spv",   "wmma_peak_u8_u32.spv",   "gemm_shmem_u8_u32.spv",   "fma_opt_u8_u32.spv",   false },
+    { VK_COMPONENT_TYPE_FLOAT16_KHR, VK_COMPONENT_TYPE_FLOAT32_KHR, "gemm_fp16_fp32.spv", "wmma_peak_fp16_fp32.spv", "gemm_v07_fp16_fp32.spv", "fma_opt_fp16_fp32.spv", true },
+    { VK_COMPONENT_TYPE_FLOAT16_KHR, VK_COMPONENT_TYPE_FLOAT16_KHR, "gemm_fp16_fp16.spv", "wmma_peak_fp16_fp16.spv", "gemm_v07_fp16_fp16.spv", "fma_opt_fp16_fp16.spv", true },
+    { VK_COMPONENT_TYPE_SINT8_KHR,   VK_COMPONENT_TYPE_SINT32_KHR,  "gemm_s8_s32.spv",   "wmma_peak_s8_s32.spv",   "gemm_v07_s8_s32.spv",   "fma_opt_s8_s32.spv",   false },
+    { VK_COMPONENT_TYPE_UINT8_KHR,   VK_COMPONENT_TYPE_UINT32_KHR,  "gemm_u8_u32.spv",   "wmma_peak_u8_u32.spv",   "gemm_v07_u8_u32.spv",   "fma_opt_u8_u32.spv",   false },
 };
 
 static int32_t findMemoryType(const VkPhysicalDeviceMemoryProperties &mp,
@@ -1465,15 +1465,15 @@ static std::string runBenchmark(const std::string &shaderDir) {
         }
 #endif  // ===== end disabled WMMA peak test =====
 
-        // ===================== 2048x2048x2048 matmul (WMMA GEMM) =====================
+        // ===================== 1024x1024x1024 matmul (WMMA GEMM) =====================
         // Real C = A*B at M=N=K=1024 using the cooperative-matrix GEMM shader, for
         // fp16 and int8. Device-local buffers; one matmul is tiny (~2.1 GFLOP) so
         // each timed run dispatches R back-to-back (R calibrated to ~40 ms) and the
         // throughput is the best of 3 boost-warmed runs across a small tile sweep.
         {
             rep.line("");
-            rep.line("==== 2048x2048x2048 matmul (WMMA GEMM) ====");
-            const uint32_t MM = 2048, NN = 2048, KK = 2048;
+            rep.line("==== 1024x1024x1024 matmul (WMMA GEMM) ====");
+            const uint32_t MM = 1024, NN = 1024, KK = 1024;
             const uint32_t lM = 16, lN = 16, lK = 16;
 
             auto makeBufDL = [&](Buffer &b, VkDeviceSize bytes) -> bool {
@@ -1523,10 +1523,14 @@ static std::string runBenchmark(const std::string &shaderDir) {
                         c.CType == combo.outputType && c.ResultType == combo.outputType) { have16 = true; break; }
 
                 rep.line("");
-                rep.line("---- %s*%s -> %s [matmul 2048^3] ----",
+                rep.line("---- %s*%s -> %s [%s matmul 1024^3] ----",
                          componentTypeName(combo.inputType), componentTypeName(combo.inputType),
-                         componentTypeName(combo.outputType));
+                         componentTypeName(combo.outputType), tiled ? "v07 WMMA tiled" : "simple WMMA");
                 if (!have16) { rep.line("  no 16x16x16 subgroup shape; skip"); continue; }
+
+                // Show the shader source for this data type.
+                dumpTypedShaderSource(shaderDir, tiled ? "gemm_v07.comp" : "gemm_coopmat.comp",
+                                      glslTypeName(combo.inputType), glslTypeName(combo.outputType), rep);
 
                 std::string path = shaderDir + "/" + (tiled ? combo.shmemSpvFile : combo.spvFile);
                 std::ifstream f(path, std::ios::binary | std::ios::ate);
@@ -1555,13 +1559,18 @@ static std::string runBenchmark(const std::string &shaderDir) {
                 // so a 256x256 tile gives 1/16 + 1/16 = 1/8. cR*cC controls the
                 // per-subgroup register footprint; more subgroups enlarge the tile
                 // without growing it. { cR, cC, WG_W, WG_H, BK }.
+                // v07 configs tuned for wave64 / 1024^3 (64 VGPR, 2KB LDS/wave for
+                // 64 waves, >=512 waves). { cR, cC, WG_W, WG_H, BK }.
+                //  - {4,2,4,2,16}: TILE 128x128, 8 frag, 8 waves/wg -> 512 waves,
+                //    ~1.3KB LDS/wave, ~50 VGPR  (primary)
                 struct Cfg { uint32_t cR, cC, wgW, wgH, bk; };
                 const Cfg cfgs[] = {
-                    { 2, 2, 4, 4, 32 },   // TILE 128x128, load:MulAdd = 1/4,  4 accum
-                    { 2, 4, 4, 8, 16 },   // TILE 256x256, load:MulAdd = 1/8,  8 accum, 32 sg (>=512 waves)
-                    { 4, 4, 4, 4, 16 },   // TILE 256x256, load:MulAdd = 1/8, 16 accum (alt)
+                    { 4, 2, 4, 2, 16 },   // TILE 128x128, 8 frag/warp, 8 waves/wg -> 512 waves
+                    { 2, 2, 4, 4, 16 },   // TILE 128x128, 4 frag/warp, 16 waves/wg (more occupancy)
+                    { 4, 2, 4, 2, 32 },   // TILE 128x128, BK=32 (more reuse, ~2KB LDS/wave)
                 };
                 double bestRate = 0.0, bestMs = 0.0, bestBW = 0.0; uint32_t bTileM = 0, bTileN = 0;
+                bool dumpedExec = false;   // dump GPU ISA (sp3) once per type
 
                 for (const auto &cfg : cfgs) {
                     uint32_t cR = cfg.cR, cC = cfg.cC, wgW = cfg.wgW, wgH = cfg.wgH;
@@ -1641,14 +1650,22 @@ static std::string runBenchmark(const std::string &shaderDir) {
                     ssci.pSpecializationInfo = &spi;
                     VkComputePipelineCreateInfo cpci2 = { VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
                     cpci2.stage = ssci; cpci2.layout = pipelineLayout;
-                    if (wantPipeExec) cpci2.flags |= VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR;
+                    if (wantPipeExec) cpci2.flags |= VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR |
+                                                      VK_PIPELINE_CREATE_CAPTURE_INTERNAL_REPRESENTATIONS_BIT_KHR;
                     VkPipeline pipeline;
                     if (vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &cpci2, nullptr, &pipeline) != VK_SUCCESS) {
                         rep.line("  cfg pipeline create failed"); freeBufDL(bA); freeBufDL(bB); freeBufDL(bC); freeBufDL(bD); continue;
                     }
-                    // Per-config pipeline statistics (VGPR/SGPR usage, etc.).
-                    if (wantPipeExec)
-                        dumpPipelineStatsOnly(device, pipeline, rep, "stat", pfnPeProps, pfnPeStats);
+                    // GPU ISA (sp3) once per type; statistics (VGPR/SGPR) per config.
+                    if (wantPipeExec) {
+                        if (!dumpedExec) {
+                            rep.line("    -- compiled GPU executable (ISA / sp3, statistics) --");
+                            dumpPipelineExecutables(device, pipeline, rep, pfnPeProps, pfnPeStats, pfnPeIR);
+                            dumpedExec = true;
+                        } else {
+                            dumpPipelineStatsOnly(device, pipeline, rep, "stat", pfnPeProps, pfnPeStats);
+                        }
+                    }
 
                     uint32_t gx = N / tileN, gy = M / tileM;
                     VkResult wr = VK_SUCCESS;
@@ -1717,7 +1734,7 @@ static std::string runBenchmark(const std::string &shaderDir) {
                     if (combo.isFloat && !canFloat) continue;
                     if (!combo.isFloat && !canInt) continue;
                     rep.line("");
-                    rep.line("---- %s*%s -> %s [optimized FMA matmul 2048^3] ----",
+                    rep.line("---- %s*%s -> %s [optimized FMA matmul 1024^3] ----",
                              componentTypeName(combo.inputType), componentTypeName(combo.inputType),
                              componentTypeName(combo.outputType));
                     // Show the shader source for this data type.
@@ -1820,10 +1837,9 @@ static std::string runBenchmark(const std::string &shaderDir) {
                 }
             };
 
-            // benchGemm(false);   // simple WMMA GEMM   (disabled)
-            // benchGemm(true);    // tiled WMMA GEMM    (disabled)
-            (void)benchGemm;       // keep lambda referenced (avoids unused warning)
-            benchFma();            // optimized FMA/MAD GEMM (no WMMA) -- the active test
+            // benchGemm(false); // simple WMMA GEMM (disabled)
+            benchGemm(true);      // v07-style tiled WMMA GEMM -- the active test
+            (void)benchFma;       // FMA path kept but not run (avoids unused warning)
         }
 
         vkDestroyCommandPool(device, cmdPool, nullptr);
