@@ -1844,29 +1844,33 @@ static std::string runBenchmark(const std::string &shaderDir) {
             (void)benchGemm; (void)benchFma;        // kept but not run
         }
 
-        // ===================== Pure FMA peak (ALU) vs WMMA peak =====================
-        // Same "repeat a compute op REPEATS times in registers" workload as the
-        // WMMA peak test, but using vector FMA/MAD instead of cooperative matrix,
-        // so the pure-compute throughput of the ALU can be compared to the matrix
-        // unit. No memory in the loop; cross-fed accumulators prevent folding.
+        // ===================== WMMA vs FMA peak comparison =====================
+        // Run the pure-compute peak both ways -- cooperative matrix (matrix unit)
+        // and plain vector FMA/MAD (ALU) -- on the same "repeat a compute op
+        // REPEATS times in registers" workload, then print a comparison table.
         {
             rep.line("");
-            rep.line("==== Pure FMA/MAD peak (no WMMA) ====");
-            const uint32_t REPEATS = 1024;     // same repeat count as the WMMA peak
-            const uint32_t NVEC = 8;           // vec4 accumulators per thread (ILP)
+            rep.line("==== WMMA vs FMA peak comparison ====");
+            const uint32_t REPEATS = 1024;
+            const uint32_t NACC = 4;            // WMMA accumulators per subgroup
+            const uint32_t NVEC = 8;            // FMA vec4 accumulators per thread
             const uint32_t SG_PER_WG = 4;
-            const uint32_t WORKGROUPS = 512;   // 512*4 = 2048 waves (>=512)
+            const uint32_t WORKGROUPS = 512;
+            const uint32_t BUF_TILES_W = 256;   // wmma_peak tile buffer (cache resident)
             uint32_t localX = reqSg * SG_PER_WG;
-            uint64_t totalThreads = (uint64_t)WORKGROUPS * localX;
-            rep.line("config: workgroups=%u, localX=%u, waves=%llu, NVEC=%u, REPEATS=%u",
-                     WORKGROUPS, localX, (unsigned long long)(WORKGROUPS * SG_PER_WG), NVEC, REPEATS);
+            uint64_t totalSubgroups = (uint64_t)WORKGROUPS * SG_PER_WG;
+            uint64_t totalThreads   = (uint64_t)WORKGROUPS * localX;
+            rep.line("config: workgroups=%u, localX=%u, waves=%llu, REPEATS=%u, NACC=%u, NVEC=%u",
+                     WORKGROUPS, localX, (unsigned long long)totalSubgroups, REPEATS, NACC, NVEC);
 
-            struct Pk { const char *suffix; VkComponentTypeKHR ot; bool isFloat; };
-            const Pk pks[] = {
-                { "fp16_fp32", VK_COMPONENT_TYPE_FLOAT32_KHR, true },
-                { "fp16_fp16", VK_COMPONENT_TYPE_FLOAT16_KHR, true },
-                { "s8_s32",    VK_COMPONENT_TYPE_SINT32_KHR,  false },
+            struct T { const char *label, *suffix; VkComponentTypeKHR in, ot; bool isFloat; };
+            const T types[] = {
+                { "fp16*fp16->fp32", "fp16_fp32", VK_COMPONENT_TYPE_FLOAT16_KHR, VK_COMPONENT_TYPE_FLOAT32_KHR, true },
+                { "fp16*fp16->fp16", "fp16_fp16", VK_COMPONENT_TYPE_FLOAT16_KHR, VK_COMPONENT_TYPE_FLOAT16_KHR, true },
+                { "s8*s8->s32",      "s8_s32",    VK_COMPONENT_TYPE_SINT8_KHR,   VK_COMPONENT_TYPE_SINT32_KHR,  false },
             };
+            double wmmaRate[3] = { -1, -1, -1 };
+            double fmaRate[3]  = { -1, -1, -1 };
 
             auto makeHV = [&](Buffer &b, VkDeviceSize bytes) -> bool {
                 b.size = bytes;
@@ -1882,6 +1886,7 @@ static std::string runBenchmark(const std::string &shaderDir) {
                 mai.allocationSize = mr.size; mai.memoryTypeIndex = (uint32_t)mi;
                 if (vkAllocateMemory(device, &mai, nullptr, &b.devMem) != VK_SUCCESS) return false;
                 vkBindBufferMemory(device, b.dev, b.devMem, 0);
+                vkMapMemory(device, b.devMem, 0, bytes, 0, &b.ptr);
                 return true;
             };
             auto freeHV = [&](Buffer &b) {
@@ -1889,54 +1894,18 @@ static std::string runBenchmark(const std::string &shaderDir) {
                 if (b.devMem) vkFreeMemory(device, b.devMem, nullptr);
                 b = Buffer{};
             };
-
-            for (const auto &pk : pks) {
-                size_t outElem = componentBits(pk.ot) / 8;
-                const char *rateUnit = pk.isFloat ? "TFLOPS" : "TOPS";
-                rep.line("");
-                rep.line("---- %s [FMA peak] ----", pk.suffix);
-                dumpTypedShaderSource(shaderDir, "fma_peak.comp", "(see VACC)", glslTypeName(pk.ot), rep);
-
-                std::string path = shaderDir + "/fma_peak_" + pk.suffix + ".spv";
-                std::ifstream f(path, std::ios::binary | std::ios::ate);
-                if (!f) { rep.line("  shader not found: %s", path.c_str()); continue; }
-                std::streamsize sz = f.tellg(); f.seekg(0);
-                std::vector<char> spv(sz); f.read(spv.data(), sz);
-                VkShaderModuleCreateInfo smci = { VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO };
-                smci.codeSize = (size_t)sz; smci.pCode = (const uint32_t *)spv.data();
-                VkShaderModule module;
-                if (vkCreateShaderModule(device, &smci, nullptr, &module) != VK_SUCCESS) { rep.line("  module create failed"); continue; }
-
-                Buffer buf;   // one buffer bound to all 4 slots; D sink = totalThreads elems
-                if (!makeHV(buf, (VkDeviceSize)totalThreads * outElem)) { rep.line("  alloc failed"); vkDestroyShaderModule(device, module, nullptr); continue; }
-                VkDescriptorBufferInfo dbi[4];
-                VkWriteDescriptorSet wds[4];
+            auto bindAll = [&](Buffer *bufs4) {
+                VkDescriptorBufferInfo dbi[4]; VkWriteDescriptorSet wds[4];
                 for (int i = 0; i < 4; ++i) {
-                    dbi[i] = { buf.dev, 0, VK_WHOLE_SIZE };
+                    dbi[i] = { bufs4[i].dev, 0, VK_WHOLE_SIZE };
                     wds[i] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
                     wds[i].dstSet = descSet; wds[i].dstBinding = (uint32_t)i; wds[i].descriptorCount = 1;
                     wds[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; wds[i].pBufferInfo = &dbi[i];
                 }
                 vkUpdateDescriptorSets(device, 4, wds, 0, nullptr);
-
-                uint32_t spec[3] = { REPEATS, NVEC, localX };
-                VkSpecializationMapEntry ents[3]; for (uint32_t i = 0; i < 3; ++i) ents[i] = { i, (uint32_t)(i * 4), 4 };
-                VkSpecializationInfo spi = { 3, ents, sizeof(spec), spec };
-                VkPipelineShaderStageCreateInfo ssci = { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO };
-                ssci.stage = VK_SHADER_STAGE_COMPUTE_BIT; ssci.module = module; ssci.pName = "main"; ssci.pSpecializationInfo = &spi;
-                VkComputePipelineCreateInfo cpci2 = { VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
-                cpci2.stage = ssci; cpci2.layout = pipelineLayout;
-                if (wantPipeExec) cpci2.flags |= VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR |
-                                                 VK_PIPELINE_CREATE_CAPTURE_INTERNAL_REPRESENTATIONS_BIT_KHR;
-                VkPipeline pipeline;
-                if (vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &cpci2, nullptr, &pipeline) != VK_SUCCESS) {
-                    rep.line("  pipeline create failed"); freeHV(buf); vkDestroyShaderModule(device, module, nullptr); continue;
-                }
-                if (wantPipeExec) {
-                    rep.line("    -- compiled GPU executable (ISA / sp3, statistics) --");
-                    dumpPipelineExecutables(device, pipeline, rep, pfnPeProps, pfnPeStats, pfnPeIR);
-                }
-
+            };
+            // Calibrate-batch + boost-warm + best-of-3, return 2-op rate (T/s).
+            auto measure = [&](VkPipeline pipeline, double opsPerDispatch) -> double {
                 VkCommandBufferBeginInfo bi = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
                 VkSubmitInfo si = { VK_STRUCTURE_TYPE_SUBMIT_INFO }; si.commandBufferCount = 1; si.pCommandBuffers = &cmd;
                 VkResult wr = VK_SUCCESS;
@@ -1955,26 +1924,114 @@ static std::string runBenchmark(const std::string &shaderDir) {
                     if (wr != VK_SUCCESS) return -1.0;
                     return std::chrono::duration<double>(b - a).count();
                 };
-                recordR(1); timed(); double t1 = timed();
-                bool lost = (t1 < 0);
-                uint32_t R = lost ? 1 : (uint32_t)std::max(1.0, 0.04 / t1); if (R > 4000) R = 4000;
-                double best = 1e30;
-                if (!lost) {
-                    recordR(R);
-                    double w = 0.0; while (w < 0.2) { double s = timed(); if (s < 0) { lost = true; break; } w += s; }
-                    for (int t = 0; !lost && t < 3; ++t) { double s = timed(); if (s < 0) { lost = true; break; } if (s < best) best = s; }
+                recordR(1); timed(); double t1 = timed(); if (t1 < 0) return -1.0;
+                uint32_t R = (uint32_t)std::max(1.0, 0.04 / t1); if (R > 4000) R = 4000;
+                recordR(R);
+                double w = 0.0; while (w < 0.2) { double s = timed(); if (s < 0) return -1.0; w += s; }
+                double best = 1e30; for (int t = 0; t < 3; ++t) { double s = timed(); if (s < 0) return -1.0; if (s < best) best = s; }
+                return opsPerDispatch * (double)R / best / 1e12;
+            };
+            auto loadModule = [&](const std::string &path) -> VkShaderModule {
+                std::ifstream f(path, std::ios::binary | std::ios::ate);
+                if (!f) return VK_NULL_HANDLE;
+                std::streamsize sz = f.tellg(); f.seekg(0);
+                std::vector<char> spv(sz); f.read(spv.data(), sz);
+                VkShaderModuleCreateInfo smci = { VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO };
+                smci.codeSize = (size_t)sz; smci.pCode = (const uint32_t *)spv.data();
+                VkShaderModule m; if (vkCreateShaderModule(device, &smci, nullptr, &m) != VK_SUCCESS) return VK_NULL_HANDLE;
+                return m;
+            };
+
+            for (uint32_t ti = 0; ti < 3; ++ti) {
+                const T &t = types[ti];
+                size_t inElem = componentBits(t.in) / 8, outElem = componentBits(t.ot) / 8;
+                rep.line("");
+                rep.line("---- %s ----", t.label);
+
+                // ---- WMMA peak (needs a 16x16x16 subgroup shape) ----
+                bool have16 = false;
+                for (const auto &c : coop)
+                    if (c.scope == VK_SCOPE_SUBGROUP_KHR && c.MSize == 16 && c.NSize == 16 && c.KSize == 16 &&
+                        c.AType == t.in && c.BType == t.in && c.CType == t.ot && c.ResultType == t.ot) { have16 = true; break; }
+                if (have16) {
+                    VkShaderModule mod = loadModule(shaderDir + "/wmma_peak_" + std::string(t.suffix) + ".spv");
+                    if (mod) {
+                        Buffer bufs[4];
+                        bool ok = makeHV(bufs[0], (VkDeviceSize)BUF_TILES_W * 256 * inElem) &&
+                                  makeHV(bufs[1], (VkDeviceSize)BUF_TILES_W * 256 * inElem) &&
+                                  makeHV(bufs[2], (VkDeviceSize)256 * outElem) &&
+                                  makeHV(bufs[3], (VkDeviceSize)totalSubgroups * 256 * outElem);
+                        if (ok) {
+                            for (VkDeviceSize i = 0; i < (VkDeviceSize)BUF_TILES_W * 256; ++i) {
+                                if (t.isFloat) { ((uint16_t *)bufs[0].ptr)[i] = floatToHalf(0.01f); ((uint16_t *)bufs[1].ptr)[i] = floatToHalf(0.01f); }
+                                else { ((int8_t *)bufs[0].ptr)[i] = 1; ((int8_t *)bufs[1].ptr)[i] = 1; }
+                            }
+                            bindAll(bufs);
+                            uint32_t spec[8] = { 16, 16, 16, REPEATS, NACC, localX, 0u, BUF_TILES_W };
+                            VkSpecializationMapEntry ents[8]; for (uint32_t i = 0; i < 8; ++i) ents[i] = { i, (uint32_t)(i * 4), 4 };
+                            VkSpecializationInfo spi = { 8, ents, sizeof(spec), spec };
+                            VkPipelineShaderStageRequiredSubgroupSizeCreateInfo rss = { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO };
+                            rss.requiredSubgroupSize = reqSg;
+                            VkPipelineShaderStageCreateInfo ssci = { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO };
+                            ssci.pNext = &rss; ssci.flags = VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT;
+                            ssci.stage = VK_SHADER_STAGE_COMPUTE_BIT; ssci.module = mod; ssci.pName = "main"; ssci.pSpecializationInfo = &spi;
+                            VkComputePipelineCreateInfo cpci2 = { VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
+                            cpci2.stage = ssci; cpci2.layout = pipelineLayout;
+                            VkPipeline pipe;
+                            if (vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &cpci2, nullptr, &pipe) == VK_SUCCESS) {
+                                double ops = 2.0 * 16.0 * 16.0 * 16.0 * (double)NACC * (double)REPEATS * (double)totalSubgroups;
+                                wmmaRate[ti] = measure(pipe, ops);
+                                vkDestroyPipeline(device, pipe, nullptr);
+                                rep.line("  WMMA: %.2f %s (%.2f TMAC/s)", wmmaRate[ti], t.isFloat ? "TFLOPS" : "TOPS", wmmaRate[ti] / 2.0);
+                            } else rep.line("  WMMA: pipeline create failed");
+                        }
+                        freeHV(bufs[0]); freeHV(bufs[1]); freeHV(bufs[2]); freeHV(bufs[3]);
+                        vkDestroyShaderModule(device, mod, nullptr);
+                    }
+                } else rep.line("  WMMA: no 16x16x16 shape (skip)");
+
+                // ---- FMA peak (pure ALU) ----
+                {
+                    VkShaderModule mod = loadModule(shaderDir + "/fma_peak_" + std::string(t.suffix) + ".spv");
+                    if (mod) {
+                        Buffer buf; Buffer bufs[4];
+                        if (makeHV(buf, (VkDeviceSize)totalThreads * outElem)) {
+                            for (int i = 0; i < 4; ++i) bufs[i] = buf;
+                            bindAll(bufs);
+                            uint32_t spec[3] = { REPEATS, NVEC, localX };
+                            VkSpecializationMapEntry ents[3]; for (uint32_t i = 0; i < 3; ++i) ents[i] = { i, (uint32_t)(i * 4), 4 };
+                            VkSpecializationInfo spi = { 3, ents, sizeof(spec), spec };
+                            VkPipelineShaderStageCreateInfo ssci = { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO };
+                            ssci.stage = VK_SHADER_STAGE_COMPUTE_BIT; ssci.module = mod; ssci.pName = "main"; ssci.pSpecializationInfo = &spi;
+                            VkComputePipelineCreateInfo cpci2 = { VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
+                            cpci2.stage = ssci; cpci2.layout = pipelineLayout;
+                            VkPipeline pipe;
+                            if (vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &cpci2, nullptr, &pipe) == VK_SUCCESS) {
+                                double ops = 2.0 * 4.0 * (double)NVEC * (double)REPEATS * (double)totalThreads;
+                                fmaRate[ti] = measure(pipe, ops);
+                                vkDestroyPipeline(device, pipe, nullptr);
+                                rep.line("  FMA : %.2f %s (%.2f TMAC/s)", fmaRate[ti], t.isFloat ? "TFLOPS" : "TOPS", fmaRate[ti] / 2.0);
+                            } else rep.line("  FMA : pipeline create failed");
+                            freeHV(buf);
+                        }
+                        vkDestroyShaderModule(device, mod, nullptr);
+                    }
                 }
-                vkDestroyPipeline(device, pipeline, nullptr);
-                if (!lost) {
-                    double macs = 4.0 * (double)NVEC * (double)REPEATS * (double)totalThreads * (double)R;
-                    double ops = 2.0 * macs;
-                    double rate = ops / best / 1e12;
-                    rep.line("    R=%u: time=%.3f ms | compute=%.1f G%s | %.2f %s = %.2f TMAC/s",
-                             R, best * 1e3, ops / 1e9, pk.isFloat ? "FLOP" : "OP", rate, rateUnit, rate / 2.0);
-                } else rep.line("    device-lost");
-                freeHV(buf);
-                vkDestroyShaderModule(device, module, nullptr);
             }
+
+            // ---- comparison table ----
+            rep.line("");
+            rep.line("==== WMMA vs FMA peak (2-op TFLOPS/TOPS) ====");
+            rep.line("  %-16s %10s %10s %10s", "type", "WMMA", "FMA", "WMMA/FMA");
+            for (uint32_t ti = 0; ti < 3; ++ti) {
+                char w[24], fm[24], ratio[16];
+                if (wmmaRate[ti] >= 0) snprintf(w, sizeof w, "%.2f", wmmaRate[ti]); else snprintf(w, sizeof w, "n/a");
+                if (fmaRate[ti] >= 0) snprintf(fm, sizeof fm, "%.2f", fmaRate[ti]); else snprintf(fm, sizeof fm, "n/a");
+                if (wmmaRate[ti] > 0 && fmaRate[ti] > 0) snprintf(ratio, sizeof ratio, "%.2fx", wmmaRate[ti] / fmaRate[ti]);
+                else snprintf(ratio, sizeof ratio, "-");
+                rep.line("  %-16s %10s %10s %10s", types[ti].label, w, fm, ratio);
+            }
+            rep.line("  (fp16 rows = TFLOPS, s8 row = TOPS; TMAC/s = half. multiply-add = 2 ops.)");
         }
 
         vkDestroyCommandPool(device, cmdPool, nullptr);
