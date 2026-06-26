@@ -1465,6 +1465,27 @@ static std::string runBenchmark(const std::string &shaderDir) {
         }
 #endif  // ===== end disabled WMMA peak test =====
 
+        // ---- Unified summary collected across the four benchmarks ----
+        // Four tests x three data types. Each test stores its best rate here and a
+        // grouped, per-data-type summary is printed at the very end of the run.
+        //   Test 1: Peak WMMA Throughput  (matrix engine, register-resident loop)
+        //   Test 2: Peak FMA  Throughput  (vector ALU, register-resident loop)
+        //   Test 3: MATMUL with WMMA      (real 1024^3 GEMM on the matrix engine)
+        //   Test 4: MATMUL with FMA       (real 1024^3 GEMM on the vector ALU)
+        enum { TY_FP16_FP32 = 0, TY_FP16_FP16 = 1, TY_S8_S32 = 2, NUM_TY = 3 };
+        const char *kTyLabel[NUM_TY] = { "fp16*fp16 -> fp32", "fp16*fp16 -> fp16", "s8*s8 -> s32" };
+        const bool  kTyFloat[NUM_TY] = { true, true, false };
+        double sumPeakWmma[NUM_TY] = { -1, -1, -1 };
+        double sumPeakFma [NUM_TY] = { -1, -1, -1 };
+        double sumMatWmma [NUM_TY] = { -1, -1, -1 };
+        double sumMatFma  [NUM_TY] = { -1, -1, -1 };
+        auto tyIndexOf = [](VkComponentTypeKHR in, VkComponentTypeKHR ot) -> int {
+            if (in == VK_COMPONENT_TYPE_FLOAT16_KHR && ot == VK_COMPONENT_TYPE_FLOAT32_KHR) return TY_FP16_FP32;
+            if (in == VK_COMPONENT_TYPE_FLOAT16_KHR && ot == VK_COMPONENT_TYPE_FLOAT16_KHR) return TY_FP16_FP16;
+            if (in == VK_COMPONENT_TYPE_SINT8_KHR   && ot == VK_COMPONENT_TYPE_SINT32_KHR)  return TY_S8_S32;
+            return -1;   // u8 etc.: benchmarked-but-not-summarized -> skipped below
+        };
+
         // ===================== 1024x1024x1024 matmul (WMMA GEMM) =====================
         // Real C = A*B at M=N=K=1024 using the cooperative-matrix GEMM shader, for
         // fp16 and int8. Device-local buffers; one matmul is tiny (~2.1 GFLOP) so
@@ -1516,6 +1537,8 @@ static std::string runBenchmark(const std::string &shaderDir) {
               for (const auto &combo : kCombos) {
                 if (combo.isFloat && !canFloat) continue;
                 if (!combo.isFloat && !canInt) continue;
+                int tyIdx = tyIndexOf(combo.inputType, combo.outputType);
+                if (tyIdx < 0) continue;   // only the three summarized data types
                 bool have16 = false;
                 for (const auto &c : coop)
                     if (c.scope == VK_SCOPE_SUBGROUP_KHR && c.MSize == 16 && c.NSize == 16 && c.KSize == 16 &&
@@ -1718,6 +1741,7 @@ static std::string runBenchmark(const std::string &shaderDir) {
                     rep.line("  BEST: tile %ux%u  %.4f ms/matmul | %.2f %s = %.2f TMAC/s "
                              "| min DRAM BW=%.1f GB/s",
                              bTileM, bTileN, bestMs, bestRate, rateUnit, bestRate / 2.0, bestBW);
+                if (tiled && bestRate > 0.0) sumMatWmma[tyIdx] = bestRate;   // Test 3 result
               }
             };
             // v06-style FMA/MAD GEMM (no WMMA): warp/thread tiled, transposed A.
@@ -1735,6 +1759,8 @@ static std::string runBenchmark(const std::string &shaderDir) {
                 for (const auto &combo : kCombos) {
                     if (combo.isFloat && !canFloat) continue;
                     if (!combo.isFloat && !canInt) continue;
+                    int tyIdx = tyIndexOf(combo.inputType, combo.outputType);
+                    if (tyIdx < 0) continue;   // only the three summarized data types
                     rep.line("");
                     rep.line("---- %s*%s -> %s [optimized FMA matmul 1024^3] ----",
                              componentTypeName(combo.inputType), componentTypeName(combo.inputType),
@@ -1836,12 +1862,13 @@ static std::string runBenchmark(const std::string &shaderDir) {
                     if (bestRate > 0.0)
                         rep.line("  BEST: BM%u BN%u  %.4f ms/matmul | %.2f %s = %.2f TMAC/s | min DRAM BW=%.1f GB/s",
                                  bBM, bBN, bestMs, bestRate, rateUnit, bestRate / 2.0, bestBW);
+                    if (bestRate > 0.0) sumMatFma[tyIdx] = bestRate;   // Test 4 result
                 }
             };
 
-            // benchGemm(false); benchGemm(true);   // WMMA GEMM (disabled)
-            // benchFma();                          // v06 FMA GEMM (disabled)
-            (void)benchGemm; (void)benchFma;        // kept but not run
+            benchGemm(true);   // Test 3: MATMUL with WMMA (v07 tiled GEMM, 1024^3)
+            benchFma();        // Test 4: MATMUL with FMA  (v06 GEMM, 1024^3)
+            (void)benchGemm;   // benchGemm(false) (simple WMMA) intentionally not run
         }
 
         // ===================== WMMA vs FMA peak comparison =====================
@@ -1869,8 +1896,8 @@ static std::string runBenchmark(const std::string &shaderDir) {
                 { "fp16*fp16->fp16", "fp16_fp16", VK_COMPONENT_TYPE_FLOAT16_KHR, VK_COMPONENT_TYPE_FLOAT16_KHR, true },
                 { "s8*s8->s32",      "s8_s32",    VK_COMPONENT_TYPE_SINT8_KHR,   VK_COMPONENT_TYPE_SINT32_KHR,  false },
             };
-            double wmmaRate[3] = { -1, -1, -1 };
-            double fmaRate[3]  = { -1, -1, -1 };
+            // Results stored into the shared summary arrays sumPeakWmma / sumPeakFma
+            // (index ti maps directly to TY_FP16_FP32/TY_FP16_FP16/TY_S8_S32).
 
             auto makeHV = [&](Buffer &b, VkDeviceSize bytes) -> bool {
                 b.size = bytes;
@@ -1980,9 +2007,9 @@ static std::string runBenchmark(const std::string &shaderDir) {
                             VkPipeline pipe;
                             if (vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &cpci2, nullptr, &pipe) == VK_SUCCESS) {
                                 double ops = 2.0 * 16.0 * 16.0 * 16.0 * (double)NACC * (double)REPEATS * (double)totalSubgroups;
-                                wmmaRate[ti] = measure(pipe, ops);
+                                sumPeakWmma[ti] = measure(pipe, ops);
                                 vkDestroyPipeline(device, pipe, nullptr);
-                                rep.line("  WMMA: %.2f %s (%.2f TMAC/s)", wmmaRate[ti], t.isFloat ? "TFLOPS" : "TOPS", wmmaRate[ti] / 2.0);
+                                rep.line("  WMMA: %.2f %s (%.2f TMAC/s)", sumPeakWmma[ti], t.isFloat ? "TFLOPS" : "TOPS", sumPeakWmma[ti] / 2.0);
                             } else rep.line("  WMMA: pipeline create failed");
                         }
                         freeHV(bufs[0]); freeHV(bufs[1]); freeHV(bufs[2]); freeHV(bufs[3]);
@@ -2008,9 +2035,9 @@ static std::string runBenchmark(const std::string &shaderDir) {
                             VkPipeline pipe;
                             if (vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &cpci2, nullptr, &pipe) == VK_SUCCESS) {
                                 double ops = 2.0 * 4.0 * (double)NVEC * (double)REPEATS * (double)totalThreads;
-                                fmaRate[ti] = measure(pipe, ops);
+                                sumPeakFma[ti] = measure(pipe, ops);
                                 vkDestroyPipeline(device, pipe, nullptr);
-                                rep.line("  FMA : %.2f %s (%.2f TMAC/s)", fmaRate[ti], t.isFloat ? "TFLOPS" : "TOPS", fmaRate[ti] / 2.0);
+                                rep.line("  FMA : %.2f %s (%.2f TMAC/s)", sumPeakFma[ti], t.isFloat ? "TFLOPS" : "TOPS", sumPeakFma[ti] / 2.0);
                             } else rep.line("  FMA : pipeline create failed");
                             freeHV(buf);
                         }
@@ -2019,19 +2046,29 @@ static std::string runBenchmark(const std::string &shaderDir) {
                 }
             }
 
-            // ---- comparison table ----
+        }
+
+        // ============================ FINAL SUMMARY ============================
+        // Four tests, grouped per data type. fp16 rows are TFLOPS, the s8 row is
+        // TOPS; both count 2 ops per multiply-add (a MAC = 2 ops).
+        {
             rep.line("");
-            rep.line("==== WMMA vs FMA peak (2-op TFLOPS/TOPS) ====");
-            rep.line("  %-16s %10s %10s %10s", "type", "WMMA", "FMA", "WMMA/FMA");
-            for (uint32_t ti = 0; ti < 3; ++ti) {
-                char w[24], fm[24], ratio[16];
-                if (wmmaRate[ti] >= 0) snprintf(w, sizeof w, "%.2f", wmmaRate[ti]); else snprintf(w, sizeof w, "n/a");
-                if (fmaRate[ti] >= 0) snprintf(fm, sizeof fm, "%.2f", fmaRate[ti]); else snprintf(fm, sizeof fm, "n/a");
-                if (wmmaRate[ti] > 0 && fmaRate[ti] > 0) snprintf(ratio, sizeof ratio, "%.2fx", wmmaRate[ti] / fmaRate[ti]);
-                else snprintf(ratio, sizeof ratio, "-");
-                rep.line("  %-16s %10s %10s %10s", types[ti].label, w, fm, ratio);
+            rep.line("============================ SUMMARY ============================");
+            rep.line("(fp16 -> TFLOPS, s8 -> TOPS; 2 ops per multiply-add)");
+            auto prRow = [&](const char *name, double v, const char *unit) {
+                if (v >= 0.0) rep.line("  %-24s : %8.2f %s", name, v, unit);
+                else          rep.line("  %-24s : %8s", name, "n/a");
+            };
+            for (int ti = 0; ti < NUM_TY; ++ti) {
+                const char *unit = kTyFloat[ti] ? "TFLOPS" : "TOPS";
+                rep.line("");
+                rep.line("%s", kTyLabel[ti]);
+                prRow("Peak WMMA Throughput", sumPeakWmma[ti], unit);
+                prRow("Peak FMA Throughput",  sumPeakFma[ti],  unit);
+                prRow("MATMUL with WMMA",     sumMatWmma[ti],  unit);
+                prRow("MATMUL with FMA",      sumMatFma[ti],   unit);
             }
-            rep.line("  (fp16 rows = TFLOPS, s8 row = TOPS; TMAC/s = half. multiply-add = 2 ops.)");
+            rep.line("================================================================");
         }
 
         vkDestroyCommandPool(device, cmdPool, nullptr);
