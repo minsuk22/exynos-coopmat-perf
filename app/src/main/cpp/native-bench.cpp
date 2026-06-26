@@ -1465,18 +1465,16 @@ static std::string runBenchmark(const std::string &shaderDir) {
         }
 #endif  // ===== end disabled WMMA peak test =====
 
-        // ---- Unified summary collected across the four benchmarks ----
-        // Four tests x three data types. Each test stores its best rate here and a
+        // ---- Unified summary collected across the benchmarks ----
+        // Three tests x three data types. Each test stores its best rate here and a
         // grouped, per-data-type summary is printed at the very end of the run.
         //   Test 1: Peak WMMA Throughput  (matrix engine, register-resident loop)
-        //   Test 2: Peak FMA  Throughput  (vector ALU, register-resident loop)
-        //   Test 3: MATMUL with WMMA      (real 1024^3 GEMM on the matrix engine)
-        //   Test 4: MATMUL with FMA       (real 1024^3 GEMM on the vector ALU)
+        //   Test 2: MATMUL with WMMA      (real 1024^3 GEMM on the matrix engine)
+        //   Test 3: MATMUL with FMA       (real 1024^3 GEMM on the vector ALU)
         enum { TY_FP16_FP32 = 0, TY_FP16_FP16 = 1, TY_S8_S32 = 2, NUM_TY = 3 };
         const char *kTyLabel[NUM_TY] = { "fp16*fp16 -> fp32", "fp16*fp16 -> fp16", "s8*s8 -> s32" };
         const bool  kTyFloat[NUM_TY] = { true, true, false };
         double sumPeakWmma[NUM_TY] = { -1, -1, -1 };
-        double sumPeakFma [NUM_TY] = { -1, -1, -1 };
         double sumMatWmma [NUM_TY] = { -1, -1, -1 };
         double sumMatFma  [NUM_TY] = { -1, -1, -1 };
         auto tyIndexOf = [](VkComponentTypeKHR in, VkComponentTypeKHR ot) -> int {
@@ -1871,24 +1869,22 @@ static std::string runBenchmark(const std::string &shaderDir) {
             (void)benchGemm;   // benchGemm(false) (simple WMMA) intentionally not run
         }
 
-        // ===================== WMMA vs FMA peak comparison =====================
-        // Run the pure-compute peak both ways -- cooperative matrix (matrix unit)
-        // and plain vector FMA/MAD (ALU) -- on the same "repeat a compute op
-        // REPEATS times in registers" workload, then print a comparison table.
+        // ===================== WMMA peak throughput =====================
+        // Pure-compute peak on the cooperative-matrix (matrix) unit: load a 16x16
+        // tile once into registers and repeat coopMatMulAdd REPEATS times (no
+        // memory traffic), isolating the matrix unit's issue rate.
         {
             rep.line("");
-            rep.line("==== WMMA vs FMA peak comparison ====");
+            rep.line("==== WMMA peak throughput ====");
             const uint32_t REPEATS = 1024;
             const uint32_t NACC = 4;            // WMMA accumulators per subgroup
-            const uint32_t NVEC = 8;            // FMA vec4 accumulators per thread
             const uint32_t SG_PER_WG = 4;
             const uint32_t WORKGROUPS = 512;
             const uint32_t BUF_TILES_W = 256;   // wmma_peak tile buffer (cache resident)
             uint32_t localX = reqSg * SG_PER_WG;
             uint64_t totalSubgroups = (uint64_t)WORKGROUPS * SG_PER_WG;
-            uint64_t totalThreads   = (uint64_t)WORKGROUPS * localX;
-            rep.line("config: workgroups=%u, localX=%u, waves=%llu, REPEATS=%u, NACC=%u, NVEC=%u",
-                     WORKGROUPS, localX, (unsigned long long)totalSubgroups, REPEATS, NACC, NVEC);
+            rep.line("config: workgroups=%u, localX=%u, waves=%llu, REPEATS=%u, NACC=%u",
+                     WORKGROUPS, localX, (unsigned long long)totalSubgroups, REPEATS, NACC);
 
             struct T { const char *label, *suffix; VkComponentTypeKHR in, ot; bool isFloat; };
             const T types[] = {
@@ -1896,7 +1892,7 @@ static std::string runBenchmark(const std::string &shaderDir) {
                 { "fp16*fp16->fp16", "fp16_fp16", VK_COMPONENT_TYPE_FLOAT16_KHR, VK_COMPONENT_TYPE_FLOAT16_KHR, true },
                 { "s8*s8->s32",      "s8_s32",    VK_COMPONENT_TYPE_SINT8_KHR,   VK_COMPONENT_TYPE_SINT32_KHR,  false },
             };
-            // Results stored into the shared summary arrays sumPeakWmma / sumPeakFma
+            // Results stored into the shared summary array sumPeakWmma
             // (index ti maps directly to TY_FP16_FP32/TY_FP16_FP16/TY_S8_S32).
 
             auto makeHV = [&](Buffer &b, VkDeviceSize bytes) -> bool {
@@ -2016,34 +2012,6 @@ static std::string runBenchmark(const std::string &shaderDir) {
                         vkDestroyShaderModule(device, mod, nullptr);
                     }
                 } else rep.line("  WMMA: no 16x16x16 shape (skip)");
-
-                // ---- FMA peak (pure ALU) ----
-                {
-                    VkShaderModule mod = loadModule(shaderDir + "/fma_peak_" + std::string(t.suffix) + ".spv");
-                    if (mod) {
-                        Buffer buf; Buffer bufs[4];
-                        if (makeHV(buf, (VkDeviceSize)totalThreads * outElem)) {
-                            for (int i = 0; i < 4; ++i) bufs[i] = buf;
-                            bindAll(bufs);
-                            uint32_t spec[3] = { REPEATS, NVEC, localX };
-                            VkSpecializationMapEntry ents[3]; for (uint32_t i = 0; i < 3; ++i) ents[i] = { i, (uint32_t)(i * 4), 4 };
-                            VkSpecializationInfo spi = { 3, ents, sizeof(spec), spec };
-                            VkPipelineShaderStageCreateInfo ssci = { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO };
-                            ssci.stage = VK_SHADER_STAGE_COMPUTE_BIT; ssci.module = mod; ssci.pName = "main"; ssci.pSpecializationInfo = &spi;
-                            VkComputePipelineCreateInfo cpci2 = { VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
-                            cpci2.stage = ssci; cpci2.layout = pipelineLayout;
-                            VkPipeline pipe;
-                            if (vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &cpci2, nullptr, &pipe) == VK_SUCCESS) {
-                                double ops = 2.0 * 4.0 * (double)NVEC * (double)REPEATS * (double)totalThreads;
-                                sumPeakFma[ti] = measure(pipe, ops);
-                                vkDestroyPipeline(device, pipe, nullptr);
-                                rep.line("  FMA : %.2f %s (%.2f TMAC/s)", sumPeakFma[ti], t.isFloat ? "TFLOPS" : "TOPS", sumPeakFma[ti] / 2.0);
-                            } else rep.line("  FMA : pipeline create failed");
-                            freeHV(buf);
-                        }
-                        vkDestroyShaderModule(device, mod, nullptr);
-                    }
-                }
             }
 
         }
@@ -2064,7 +2032,6 @@ static std::string runBenchmark(const std::string &shaderDir) {
                 rep.line("");
                 rep.line("%s", kTyLabel[ti]);
                 prRow("Peak WMMA Throughput", sumPeakWmma[ti], unit);
-                prRow("Peak FMA Throughput",  sumPeakFma[ti],  unit);
                 prRow("MATMUL with WMMA",     sumMatWmma[ti],  unit);
                 prRow("MATMUL with FMA",      sumMatFma[ti],   unit);
             }
