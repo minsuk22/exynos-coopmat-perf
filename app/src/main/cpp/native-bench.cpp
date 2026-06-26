@@ -320,10 +320,10 @@ struct TypeCombo {
 };
 
 static const TypeCombo kCombos[] = {
-    { VK_COMPONENT_TYPE_FLOAT16_KHR, VK_COMPONENT_TYPE_FLOAT32_KHR, "gemm_fp16_fp32.spv", "wmma_peak_fp16_fp32.spv", "gemm_v07_fp16_fp32.spv", "fma_opt_fp16_fp32.spv", true },
-    { VK_COMPONENT_TYPE_FLOAT16_KHR, VK_COMPONENT_TYPE_FLOAT16_KHR, "gemm_fp16_fp16.spv", "wmma_peak_fp16_fp16.spv", "gemm_v07_fp16_fp16.spv", "fma_opt_fp16_fp16.spv", true },
-    { VK_COMPONENT_TYPE_SINT8_KHR,   VK_COMPONENT_TYPE_SINT32_KHR,  "gemm_s8_s32.spv",   "wmma_peak_s8_s32.spv",   "gemm_v07_s8_s32.spv",   "fma_opt_s8_s32.spv",   false },
-    { VK_COMPONENT_TYPE_UINT8_KHR,   VK_COMPONENT_TYPE_UINT32_KHR,  "gemm_u8_u32.spv",   "wmma_peak_u8_u32.spv",   "gemm_v07_u8_u32.spv",   "fma_opt_u8_u32.spv",   false },
+    { VK_COMPONENT_TYPE_FLOAT16_KHR, VK_COMPONENT_TYPE_FLOAT32_KHR, "gemm_fp16_fp32.spv", "wmma_peak_fp16_fp32.spv", "gemm_v07_fp16_fp32.spv", "fma_v06_fp16_fp32.spv", true },
+    { VK_COMPONENT_TYPE_FLOAT16_KHR, VK_COMPONENT_TYPE_FLOAT16_KHR, "gemm_fp16_fp16.spv", "wmma_peak_fp16_fp16.spv", "gemm_v07_fp16_fp16.spv", "fma_v06_fp16_fp16.spv", true },
+    { VK_COMPONENT_TYPE_SINT8_KHR,   VK_COMPONENT_TYPE_SINT32_KHR,  "gemm_s8_s32.spv",   "wmma_peak_s8_s32.spv",   "gemm_v07_s8_s32.spv",   "fma_v06_s8_s32.spv",   false },
+    { VK_COMPONENT_TYPE_UINT8_KHR,   VK_COMPONENT_TYPE_UINT32_KHR,  "gemm_u8_u32.spv",   "wmma_peak_u8_u32.spv",   "gemm_v07_u8_u32.spv",   "fma_v06_u8_u32.spv",   false },
 };
 
 static int32_t findMemoryType(const VkPhysicalDeviceMemoryProperties &mp,
@@ -1720,15 +1720,17 @@ static std::string runBenchmark(const std::string &shaderDir) {
                              bTileM, bTileN, bestMs, bestRate, rateUnit, bestRate / 2.0, bestBW);
               }
             };
-            // FMA/MAD GEMM (no WMMA): same problem, scalar multiply-add on the ALU.
+            // v06-style FMA/MAD GEMM (no WMMA): warp/thread tiled, transposed A.
             auto benchFma = [&]() {
                 rep.line("");
-                rep.line("########## FMA GEMM (no WMMA; scalar multiply-add) ##########");
+                rep.line("########## v06 FMA GEMM (no WMMA; scalar multiply-add) ##########");
+                // Tuned for wave64 / 1024^3 (64 VGPR, 2KB LDS/wave for 64 waves,
+                // >=512 waves). { BM, BN, BK, TM, TN }.
                 struct FCfg { uint32_t BM, BN, BK, TM, TN; };
                 const FCfg cfgs[] = {
-                    { 64, 64, 16, 4, 4 },   // 256 threads/wg
-                    { 128, 64, 16, 8, 4 },  // 256 threads/wg, taller tile
-                    { 64, 64, 8, 8, 4 },    // 128 threads/wg
+                    { 128, 128, 16, 8, 4 },  // 512 threads/wg (8 waves) -> 512 waves, ~1KB LDS/wave
+                    { 128, 128, 8,  8, 4 },  // smaller LDS
+                    { 128, 64, 16, 8, 4 },   // 256 threads/wg, 128 wg -> 512 waves
                 };
                 for (const auto &combo : kCombos) {
                     if (combo.isFloat && !canFloat) continue;
@@ -1738,7 +1740,7 @@ static std::string runBenchmark(const std::string &shaderDir) {
                              componentTypeName(combo.inputType), componentTypeName(combo.inputType),
                              componentTypeName(combo.outputType));
                     // Show the shader source for this data type.
-                    dumpTypedShaderSource(shaderDir, "fma_gemm_opt.comp",
+                    dumpTypedShaderSource(shaderDir, "fma_v06.comp",
                                           glslTypeName(combo.inputType),
                                           glslTypeName(combo.outputType), rep);
                     std::string path = shaderDir + "/" + combo.fmaSpvFile;
@@ -1837,9 +1839,9 @@ static std::string runBenchmark(const std::string &shaderDir) {
                 }
             };
 
-            // benchGemm(false); // simple WMMA GEMM (disabled)
-            benchGemm(true);      // v07-style tiled WMMA GEMM -- the active test
-            (void)benchFma;       // FMA path kept but not run (avoids unused warning)
+            // benchGemm(false); benchGemm(true);   // WMMA GEMM (disabled)
+            (void)benchGemm;       // WMMA path kept but not run (avoids unused warning)
+            benchFma();            // v06-style FMA GEMM (no WMMA) -- the active test
         }
 
         vkDestroyCommandPool(device, cmdPool, nullptr);
