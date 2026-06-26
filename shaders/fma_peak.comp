@@ -1,25 +1,29 @@
 /*
- * Pure FMA/MAD peak microbenchmark (NO WMMA) -- the ALU counterpart of
- * wmma_peak.comp. Each thread keeps NVEC independent vec4 accumulators in
- * registers and hammers them with cross-fed multiply-adds for REPEATS
- * iterations. No memory traffic in the loop, so it measures the vector ALU's
- * peak multiply-add throughput, to compare against the WMMA (matrix-unit) peak.
+ * Pure ALU compute-peak microbenchmark (NO WMMA) -- counterpart of wmma_peak.comp.
+ * Each thread keeps NVEC accumulators in registers and hammers them for REPEATS
+ * iterations with no memory traffic, measuring the vector ALU's peak throughput.
  *
- * Folding guard: operands are seeded from the invocation id (runtime, not
- * constant) and the accumulators are cross-fed (acc[i] uses acc[(i+1)]), so the
- * loop is a coupled recurrence the compiler cannot fold to a closed form, and
- * the multiplicand varies each iteration (a real FMA, not a hoisted add).
+ *  - float (fp16/fp32): packed FMA  -> acc = fma(acc[next], bv, av)   (4 MACs / vec4)
+ *  - int   (s8):        dp4a        -> acc = dotEXT(av, bvr) + acc[next] (4 MACs / dp4a)
  *
- * ops = 2 * (NVEC*4) * REPEATS * totalThreads.
+ * int8 must use dp4a, not int32 multiply: scalar int32 multiply is slow on GPUs
+ * and would badly understate the int8 ALU capability. Operands vary (seeded from
+ * the invocation id, and bvr from the loop index) and accumulators are cross-fed,
+ * so the loop is real work the compiler cannot fold.
  *
- * Defines: C_TYPE (accumulator), VACC (vec4 of C_TYPE), IS_INT for the int path.
+ * ops = 2 * 4 * NVEC * REPEATS * totalThreads  (4 MACs per op, both paths).
+ *
+ * Defines: C_TYPE (accumulator), VACC (vec4 of C_TYPE, float path), IS_INT.
  */
 #version 450 core
 #extension GL_EXT_shader_explicit_arithmetic_types : enable
 #extension GL_EXT_control_flow_attributes : enable
+#ifdef IS_INT
+#extension GL_EXT_integer_dot_product : enable
+#endif
 
 layout(constant_id = 0) const uint REPEATS = 1024;
-layout(constant_id = 1) const uint NVEC = 8;     // independent vec4 accumulators (ILP)
+layout(constant_id = 1) const uint NVEC = 8;
 layout(local_size_x_id = 2, local_size_y = 1, local_size_z = 1) in;
 
 layout(set = 0, binding = 0) readonly  buffer BufA { C_TYPE a[]; };   // unused
@@ -30,23 +34,36 @@ layout(set = 0, binding = 3) writeonly buffer BufD { C_TYPE d[]; };   // sink
 void main()
 {
     uint gid = gl_GlobalInvocationID.x;
-    VACC av = VACC(C_TYPE(gid + 1u));
-    VACC bv = VACC(C_TYPE(gid % 3u + 1u));   // runtime multiplicand (no strength-reduce)
 
+#ifdef IS_INT
+    // ---- int8 dp4a peak ----
+    i8vec4 av[16];
+    [[unroll]] for (uint i = 0; i < NVEC; ++i)
+        av[i] = i8vec4(int8_t(gid + i + 1u), int8_t(gid + i + 2u), int8_t(i + 1u), int8_t(i + 3u));
+    C_TYPE acc[16];
+    [[unroll]] for (uint i = 0; i < NVEC; ++i) acc[i] = C_TYPE(i + 1u);
+
+    for (uint r = 0; r < REPEATS; ++r) {
+        i8vec4 bvr = i8vec4(int8_t(r + 1u), int8_t(r + 2u), int8_t(r + 3u), int8_t(r + 1u));
+        [[unroll]] for (uint i = 0; i < NVEC; ++i)
+            acc[i] = dotEXT(av[i], bvr) + acc[(i + 1u) % NVEC];   // dp4a: 4 int8 MACs
+    }
+    C_TYPE s = acc[0];
+    [[unroll]] for (uint i = 1; i < NVEC; ++i) s += acc[i];
+    d[gid] = s;
+#else
+    // ---- float FMA peak ----
+    VACC av = VACC(C_TYPE(gid + 1u));
+    VACC bv = VACC(C_TYPE(gid % 3u + 1u));
     VACC acc[16];
     [[unroll]] for (uint i = 0; i < NVEC; ++i) acc[i] = VACC(C_TYPE(i + 1u));
 
     for (uint r = 0; r < REPEATS; ++r) {
-        [[unroll]] for (uint i = 0; i < NVEC; ++i) {
-#ifdef IS_INT
-            acc[i] = acc[(i + 1u) % NVEC] * bv + av;        // integer MAD
-#else
-            acc[i] = fma(acc[(i + 1u) % NVEC], bv, av);      // float FMA
-#endif
-        }
+        [[unroll]] for (uint i = 0; i < NVEC; ++i)
+            acc[i] = fma(acc[(i + 1u) % NVEC], bv, av);          // 4 float MACs per vec4
     }
-
     VACC s = acc[0];
     [[unroll]] for (uint i = 1; i < NVEC; ++i) s += acc[i];
     d[gid] = s.x + s.y + s.z + s.w;
+#endif
 }
