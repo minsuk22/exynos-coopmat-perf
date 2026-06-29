@@ -1874,10 +1874,108 @@ static std::string runBenchmark(const std::string &shaderDir) {
                 }
             };
 
-            // Only the WMMA matmul runs, sweeping warp-tile 4x2 / 2x2 / 4x4.
-            benchGemm(true);   // MATMUL with WMMA (v07 tiled GEMM, 1024^3)
-            // benchFma();     // FMA GEMM disabled
-            (void)benchGemm; (void)benchFma;   // benchGemm(false)/benchFma not run
+            // Scalar shared-memory tiled GEMM (CUDA port, no WMMA): one thread per
+            // output. Sweep the square 2D block TILE x TILE over wave64 multiples
+            // within the 1024-thread limit: 8x8(64), 16x16(256), 24x24(576),
+            // 32x32(1024). Buffers depend only on M,N,K -> allocated once per type.
+            auto benchTiledScalar = [&]() {
+                rep.line("");
+                rep.line("########## scalar shared-memory tiled GEMM (1 thread/output, no WMMA) ##########");
+                const uint32_t TILES[] = { 8, 16, 24, 32 };
+                struct ST { const char *label, *suffix; VkComponentTypeKHR in, ot; bool isFloat; };
+                const ST sts[] = {
+                    { "fp16*fp16->fp32", "fp16_fp32", VK_COMPONENT_TYPE_FLOAT16_KHR, VK_COMPONENT_TYPE_FLOAT32_KHR, true },
+                    { "fp16*fp16->fp16", "fp16_fp16", VK_COMPONENT_TYPE_FLOAT16_KHR, VK_COMPONENT_TYPE_FLOAT16_KHR, true },
+                    { "s8*s8->s32",      "s8_s32",    VK_COMPONENT_TYPE_SINT8_KHR,   VK_COMPONENT_TYPE_SINT32_KHR,  false },
+                };
+                for (const auto &st : sts) {
+                    if (st.isFloat && !canFloat) continue;
+                    if (!st.isFloat && !canInt) continue;
+                    int tyIdx = tyIndexOf(st.in, st.ot);
+                    rep.line("");
+                    rep.line("---- %s [scalar tiled matmul %ux%ux%u] ----", st.label, MM, NN, KK);
+
+                    std::string path = shaderDir + "/gemm_scalar_" + std::string(st.suffix) + ".spv";
+                    std::ifstream f(path, std::ios::binary | std::ios::ate);
+                    if (!f) { rep.line("  shader not found: %s", path.c_str()); continue; }
+                    std::streamsize sz = f.tellg(); f.seekg(0);
+                    std::vector<char> spv(sz); f.read(spv.data(), sz);
+                    VkShaderModuleCreateInfo smci = { VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO };
+                    smci.codeSize = (size_t)sz; smci.pCode = (const uint32_t *)spv.data();
+                    VkShaderModule module;
+                    if (vkCreateShaderModule(device, &smci, nullptr, &module) != VK_SUCCESS) { rep.line("  module create failed"); continue; }
+
+                    size_t inElem = componentBits(st.in) / 8, outElem = componentBits(st.ot) / 8;
+                    const char *rateUnit = st.isFloat ? "TFLOPS" : "TOPS";
+
+                    Buffer bA, bB, bC, bD;
+                    bool ok = makeBufDL(bA, (VkDeviceSize)MM * KK * inElem) &&
+                              makeBufDL(bB, (VkDeviceSize)KK * NN * inElem) &&
+                              makeBufDL(bC, (VkDeviceSize)MM * NN * outElem) &&
+                              makeBufDL(bD, (VkDeviceSize)MM * NN * outElem);
+                    if (!ok) { rep.line("  alloc failed"); freeBufDL(bA); freeBufDL(bB); freeBufDL(bC); freeBufDL(bD); vkDestroyShaderModule(device, module, nullptr); continue; }
+                    auto fill = [&](Buffer &b, VkDeviceSize cnt) { for (VkDeviceSize i = 0; i < cnt; ++i) { if (st.isFloat) ((uint16_t *)b.ptr)[i] = floatToHalf(0.01f); else ((int8_t *)b.ptr)[i] = 1; } };
+                    fill(bA, (VkDeviceSize)MM * KK); fill(bB, (VkDeviceSize)KK * NN); memset(bD.ptr, 0, (size_t)bD.size);
+                    {
+                        VkCommandBufferBeginInfo bi = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+                        VkSubmitInfo si = { VK_STRUCTURE_TYPE_SUBMIT_INFO }; si.commandBufferCount = 1; si.pCommandBuffers = &cmd;
+                        vkBeginCommandBuffer(cmd, &bi);
+                        for (Buffer *bp : { &bA, &bB, &bD }) { VkBufferCopy cp = { 0, 0, bp->size }; vkCmdCopyBuffer(cmd, bp->host, bp->dev, 1, &cp); }
+                        vkEndCommandBuffer(cmd);
+                        vkQueueSubmit(queue, 1, &si, VK_NULL_HANDLE); vkQueueWaitIdle(queue);
+                    }
+                    VkDescriptorBufferInfo dbi[4] = { { bA.dev,0,VK_WHOLE_SIZE },{ bB.dev,0,VK_WHOLE_SIZE },{ bC.dev,0,VK_WHOLE_SIZE },{ bD.dev,0,VK_WHOLE_SIZE } };
+                    VkWriteDescriptorSet wds[4]; for (int i = 0; i < 4; ++i) { wds[i] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET }; wds[i].dstSet = descSet; wds[i].dstBinding = (uint32_t)i; wds[i].descriptorCount = 1; wds[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; wds[i].pBufferInfo = &dbi[i]; }
+                    vkUpdateDescriptorSets(device, 4, wds, 0, nullptr);
+
+                    double bestRate = 0.0; uint32_t bTile = 0;
+                    for (uint32_t TILE : TILES) {
+                        uint32_t spec[6] = { MM, NN, KK, TILE, TILE, TILE };
+                        VkSpecializationMapEntry ents[6]; for (uint32_t i = 0; i < 6; ++i) ents[i] = { i, (uint32_t)(i * 4), 4 };
+                        VkSpecializationInfo spi = { 6, ents, sizeof(spec), spec };
+                        VkPipelineShaderStageCreateInfo ssci = { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO };
+                        ssci.stage = VK_SHADER_STAGE_COMPUTE_BIT; ssci.module = module; ssci.pName = "main"; ssci.pSpecializationInfo = &spi;
+                        VkComputePipelineCreateInfo cpci2 = { VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
+                        cpci2.stage = ssci; cpci2.layout = pipelineLayout;
+                        if (wantPipeExec) cpci2.flags |= VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR;
+                        VkPipeline pipeline;
+                        if (vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &cpci2, nullptr, &pipeline) != VK_SUCCESS) { rep.line("  [block %ux%u] pipeline create failed (workgroup too large?)", TILE, TILE); continue; }
+                        uint32_t gx = (NN + TILE - 1) / TILE, gy = (MM + TILE - 1) / TILE;
+                        rep.line("  [block %ux%u = %u threads, %u waves/wg] grid %ux%u",
+                                 TILE, TILE, TILE * TILE, (TILE * TILE + reqSg - 1) / reqSg, gx, gy);
+                        if (wantPipeExec) dumpPipelineStatsOnly(device, pipeline, rep, "stat", pfnPeProps, pfnPeStats);
+
+                        VkCommandBufferBeginInfo bi = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+                        VkSubmitInfo si = { VK_STRUCTURE_TYPE_SUBMIT_INFO }; si.commandBufferCount = 1; si.pCommandBuffers = &cmd;
+                        VkResult wr = VK_SUCCESS;
+                        auto recordR = [&](uint32_t R) { vkBeginCommandBuffer(cmd, &bi); vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayout, 0, 1, &descSet, 0, nullptr); vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline); for (uint32_t i = 0; i < R; ++i) vkCmdDispatch(cmd, gx, gy, 1); vkEndCommandBuffer(cmd); };
+                        auto timed = [&]() -> double { auto a = std::chrono::high_resolution_clock::now(); vkQueueSubmit(queue, 1, &si, VK_NULL_HANDLE); wr = vkQueueWaitIdle(queue); auto b = std::chrono::high_resolution_clock::now(); if (wr != VK_SUCCESS) return -1.0; return std::chrono::duration<double>(b - a).count(); };
+                        recordR(1); timed(); double t1 = timed();
+                        if (t1 < 0) { rep.line("    device-lost"); vkDestroyPipeline(device, pipeline, nullptr); continue; }
+                        uint32_t R = (uint32_t)std::max(1.0, 0.04 / t1); if (R > 2000) R = 2000;
+                        recordR(R);
+                        double w = 0.0; bool lost = false; while (w < 0.2) { double s = timed(); if (s < 0) { lost = true; break; } w += s; }
+                        double best = 1e30; if (!lost) for (int tt = 0; tt < 3; ++tt) { double s = timed(); if (s < 0) { lost = true; break; } if (s < best) best = s; }
+                        vkDestroyPipeline(device, pipeline, nullptr);
+                        if (!lost) {
+                            double ops = 2.0 * (double)MM * (double)NN * (double)KK * (double)R;
+                            double rate = ops / best / 1e12;
+                            rep.line("    -> %.4f ms/matmul | %.2f %s = %.2f TMAC/s", best / (double)R * 1e3, rate, rateUnit, rate / 2.0);
+                            if (rate > bestRate) { bestRate = rate; bTile = TILE; }
+                        } else rep.line("    device-lost mid-measurement");
+                    }
+                    if (bestRate > 0.0) {
+                        rep.line("  BEST: block %ux%u  %.2f %s", bTile, bTile, bestRate, rateUnit);
+                        if (tyIdx >= 0) sumMatWmma[tyIdx] = bestRate;
+                    }
+                    freeBufDL(bA); freeBufDL(bB); freeBufDL(bC); freeBufDL(bD);
+                    vkDestroyShaderModule(device, module, nullptr);
+                }
+            };
+
+            // Only the scalar tiled GEMM runs, sweeping square 2D block size.
+            benchTiledScalar();
+            (void)benchGemm; (void)benchFma;   // WMMA / FMA GEMM kept but not run
         }
 
 #if 0   // ===== WMMA peak throughput DISABLED (only the WMMA matmul sweep runs) =====
@@ -2031,17 +2129,17 @@ static std::string runBenchmark(const std::string &shaderDir) {
         (void)sumPeakWmma; (void)sumMatFma;   // tests disabled; arrays unused
 
         // ============================ FINAL SUMMARY ============================
-        // Best WMMA matmul (across the 4x2 / 2x2 / 4x4 warp-tile sweep) per type.
+        // Best scalar tiled GEMM (across the 8/16/24/32 block-size sweep) per type.
         {
             rep.line("");
             rep.line("============================ SUMMARY ============================");
-            rep.line("(fp16 -> TFLOPS, s8 -> TOPS; 2 ops per multiply-add; best of 4x2/2x2/4x4)");
+            rep.line("(fp16 -> TFLOPS, s8 -> TOPS; 2 ops per multiply-add; best block size)");
             for (int ti = 0; ti < NUM_TY; ++ti) {
                 const char *unit = kTyFloat[ti] ? "TFLOPS" : "TOPS";
                 if (sumMatWmma[ti] >= 0.0)
-                    rep.line("  %-18s  MATMUL with WMMA : %8.2f %s", kTyLabel[ti], sumMatWmma[ti], unit);
+                    rep.line("  %-18s  Tiled GEMM (best blk) : %8.2f %s", kTyLabel[ti], sumMatWmma[ti], unit);
                 else
-                    rep.line("  %-18s  MATMUL with WMMA : %8s", kTyLabel[ti], "n/a");
+                    rep.line("  %-18s  Tiled GEMM (best blk) : %8s", kTyLabel[ti], "n/a");
             }
             rep.line("================================================================");
         }

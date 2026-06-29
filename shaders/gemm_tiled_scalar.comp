@@ -1,0 +1,59 @@
+/*
+ * Classic shared-memory tiled GEMM (NO WMMA) -- direct port of the CUDA kernel:
+ *
+ *   __shared__ T As[TILE][TILE], Bs[TILE][TILE];
+ *   row = blockIdx.y*TILE + ty;  col = blockIdx.x*TILE + tx;
+ *   for t in K/TILE:
+ *     As[ty][tx] = A[row*K + t*TILE+tx];   Bs[ty][tx] = B[(t*TILE+ty)*N + col];
+ *     __syncthreads();
+ *     for k in TILE: sum += As[ty][k]*Bs[k][tx];
+ *     __syncthreads();
+ *   C[row*N+col] = sum;
+ *
+ * One thread computes one output element. The 2D workgroup is square TILE x TILE
+ * (local_size_x = local_size_y = TILE). Bounds-checked, so M/N/K need not divide
+ * TILE. C = A*B (no alpha/beta). Defines: A_TYPE (input/shared), C_TYPE (accum).
+ */
+#version 450 core
+#extension GL_EXT_shader_explicit_arithmetic_types : enable
+#extension GL_EXT_control_flow_attributes : enable
+
+layout(constant_id = 0) const uint M = 2048;
+layout(constant_id = 1) const uint N = 2048;
+layout(constant_id = 2) const uint K = 2048;
+layout(constant_id = 3) const uint TILE = 16;
+layout(local_size_x_id = 4, local_size_y_id = 5, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly  buffer BufA { A_TYPE a[]; };
+layout(set = 0, binding = 1) readonly  buffer BufB { A_TYPE b[]; };
+layout(set = 0, binding = 2) readonly  buffer BufC { C_TYPE c[]; };   // unused
+layout(set = 0, binding = 3) writeonly buffer BufD { C_TYPE d[]; };
+
+shared A_TYPE As[TILE * TILE];
+shared A_TYPE Bs[TILE * TILE];
+
+void main()
+{
+    uint tx = gl_LocalInvocationID.x;
+    uint ty = gl_LocalInvocationID.y;
+    uint row = gl_WorkGroupID.y * TILE + ty;
+    uint col = gl_WorkGroupID.x * TILE + tx;
+
+    C_TYPE sum = C_TYPE(0);
+
+    uint nt = (K + TILE - 1u) / TILE;
+    for (uint t = 0; t < nt; ++t) {
+        uint a_col = t * TILE + tx;
+        As[ty * TILE + tx] = (row < M && a_col < K) ? a[row * K + a_col] : A_TYPE(0);
+        uint b_row = t * TILE + ty;
+        Bs[ty * TILE + tx] = (b_row < K && col < N) ? b[b_row * N + col] : A_TYPE(0);
+        barrier();
+
+        [[unroll]] for (uint k = 0; k < TILE; ++k)
+            sum += C_TYPE(As[ty * TILE + k]) * C_TYPE(Bs[k * TILE + tx]);
+        barrier();
+    }
+
+    if (row < M && col < N)
+        d[row * N + col] = sum;
+}
