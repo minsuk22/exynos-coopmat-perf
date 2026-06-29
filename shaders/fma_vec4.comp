@@ -1,0 +1,97 @@
+/*
+ * Vectorized FMA/MAD GEMM (NO WMMA) -- vec4 along K, coalesced global loads.
+ *
+ * vs. the scalar fma_v06.comp (acc += ar*br, one element per FMA), this kernel:
+ *   - loads A and B from global memory COALESCED (consecutive threads -> consecutive
+ *     addresses): A by k, B by n. B is stored TRANSPOSED in shared (scattered shared
+ *     store) so each column's K values are contiguous.
+ *   - packs 4 K-values into a vec4 and reduces with a packed dot / dp4a:
+ *       float16: dot(f16vec4, f16vec4)  -> packed fp16, 4 MACs / op
+ *       int8   : dotEXT(i8vec4, i8vec4) -> dp4a,        4 int8 MACs / op
+ *
+ * Each thread computes a TM x TN micro-tile. BK must be a multiple of 4.
+ * Defines: A_TYPE (input), C_TYPE (accumulator/output), VEC_TYPE (vec4 of A_TYPE),
+ *          IS_INT for the dp4a path.
+ */
+#version 450 core
+#extension GL_EXT_shader_explicit_arithmetic_types : enable
+#extension GL_EXT_control_flow_attributes : enable
+#ifdef IS_INT
+#extension GL_EXT_integer_dot_product : enable
+#endif
+
+layout(constant_id = 0) const uint M  = 2048;
+layout(constant_id = 1) const uint N  = 2048;
+layout(constant_id = 2) const uint K  = 2048;
+layout(constant_id = 3) const uint BM = 128;
+layout(constant_id = 4) const uint BN = 128;
+layout(constant_id = 5) const uint BK = 16;   // must be a multiple of 4
+layout(constant_id = 6) const uint TM = 8;
+layout(constant_id = 7) const uint TN = 8;
+layout(local_size_x_id = 8, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly  buffer BufA { A_TYPE a[]; };
+layout(set = 0, binding = 1) readonly  buffer BufB { A_TYPE b[]; };
+layout(set = 0, binding = 2) readonly  buffer BufC { C_TYPE c[]; };   // unused
+layout(set = 0, binding = 3) writeonly buffer BufD { C_TYPE d[]; };
+
+shared A_TYPE As[BM * BK];   // As[m][k], k contiguous
+shared A_TYPE Bs[BN * BK];   // Bs[n][k], k contiguous (B transposed)
+
+void main()
+{
+    uint nthreads = gl_WorkGroupSize.x;
+    uint tid      = gl_LocalInvocationID.x;
+    uint threadsX = BN / TN;
+    uint tx       = tid % threadsX;
+    uint ty       = tid / threadsX;
+    uint rowBase  = gl_WorkGroupID.y * BM;
+    uint colBase  = gl_WorkGroupID.x * BN;
+
+    C_TYPE acc[TM][TN];
+    [[unroll]] for (uint i = 0; i < TM; ++i)
+        [[unroll]] for (uint j = 0; j < TN; ++j) acc[i][j] = C_TYPE(0);
+
+    for (uint k0 = 0; k0 < K; k0 += BK) {
+        barrier();
+        // Coalesced A load: consecutive threads -> consecutive k (a is row-major).
+        for (uint idx = tid; idx < BM * BK; idx += nthreads) {
+            uint m = idx / BK, kk = idx % BK;
+            As[m * BK + kk] = a[(rowBase + m) * K + (k0 + kk)];
+        }
+        // Coalesced B load: consecutive threads -> consecutive n; stored transposed.
+        for (uint idx = tid; idx < BK * BN; idx += nthreads) {
+            uint kk = idx / BN, nn = idx % BN;
+            Bs[nn * BK + kk] = b[(k0 + kk) * N + (colBase + nn)];
+        }
+        barrier();
+
+        [[unroll]] for (uint kc = 0; kc < BK / 4u; ++kc) {
+            VEC_TYPE av[TM];
+            VEC_TYPE bv[TN];
+            [[unroll]] for (uint i = 0; i < TM; ++i) {
+                uint base = (ty * TM + i) * BK + kc * 4u;
+                av[i] = VEC_TYPE(As[base], As[base + 1u], As[base + 2u], As[base + 3u]);
+            }
+            [[unroll]] for (uint j = 0; j < TN; ++j) {
+                uint base = (tx * TN + j) * BK + kc * 4u;
+                bv[j] = VEC_TYPE(Bs[base], Bs[base + 1u], Bs[base + 2u], Bs[base + 3u]);
+            }
+            [[unroll]] for (uint i = 0; i < TM; ++i)
+                [[unroll]] for (uint j = 0; j < TN; ++j)
+#ifdef IS_INT
+                    acc[i][j] += dotEXT(av[i], bv[j]);            // dp4a: 4 int8 MACs
+#else
+                    acc[i][j] += C_TYPE(dot(av[i], bv[j]));       // packed fp16 dot: 4 MACs
+#endif
+        }
+    }
+
+    [[unroll]] for (uint i = 0; i < TM; ++i) {
+        uint gi = rowBase + ty * TM + i;
+        [[unroll]] for (uint j = 0; j < TN; ++j) {
+            uint gj = colBase + tx * TN + j;
+            d[gi * N + gj] = acc[i][j];
+        }
+    }
+}
