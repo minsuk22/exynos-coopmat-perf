@@ -1484,15 +1484,15 @@ static std::string runBenchmark(const std::string &shaderDir) {
             return -1;   // u8 etc.: benchmarked-but-not-summarized -> skipped below
         };
 
-        // ===================== 1024x1024x1024 matmul (WMMA GEMM) =====================
+        // ===================== 2048x2048x2048 matmul (WMMA GEMM) =====================
         // Real C = A*B at M=N=K=1024 using the cooperative-matrix GEMM shader, for
         // fp16 and int8. Device-local buffers; one matmul is tiny (~2.1 GFLOP) so
         // each timed run dispatches R back-to-back (R calibrated to ~40 ms) and the
         // throughput is the best of 3 boost-warmed runs across a small tile sweep.
         {
             rep.line("");
-            rep.line("==== 1024x1024x1024 matmul (WMMA GEMM) ====");
-            const uint32_t MM = 1024, NN = 1024, KK = 1024;
+            rep.line("==== 2048x2048x2048 matmul (WMMA GEMM) ====");
+            const uint32_t MM = 2048, NN = 2048, KK = 2048;
             const uint32_t lM = 16, lN = 16, lK = 16;
 
             auto makeBufDL = [&](Buffer &b, VkDeviceSize bytes) -> bool {
@@ -1544,7 +1544,7 @@ static std::string runBenchmark(const std::string &shaderDir) {
                         c.CType == combo.outputType && c.ResultType == combo.outputType) { have16 = true; break; }
 
                 rep.line("");
-                rep.line("---- %s*%s -> %s [%s matmul 1024^3] ----",
+                rep.line("---- %s*%s -> %s [%s matmul 2048^3] ----",
                          componentTypeName(combo.inputType), componentTypeName(combo.inputType),
                          componentTypeName(combo.outputType), tiled ? "v07 WMMA tiled" : "simple WMMA");
                 if (!have16) { rep.line("  no 16x16x16 subgroup shape; skip"); continue; }
