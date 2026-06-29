@@ -1584,17 +1584,24 @@ static std::string runBenchmark(const std::string &shaderDir) {
                 // 64 waves, >=512 waves). { cR, cC, WG_W, WG_H, BK }.
                 //  - {4,2,4,2,16}: TILE 128x128, 8 frag, 8 waves/wg -> 512 waves,
                 //    ~1.3KB LDS/wave, ~50 VGPR  (primary)
-                // Warp-tile (C_ROWS x C_COLS) sweep, all keeping a 128x128 block
-                // tile (WG sized so WG_H*cR = WG_W*cC = 8). This isolates the
-                // warp-tile reuse vs. occupancy trade-off:
-                //   4x2 : 8 frag/warp,  8 waves/wg, ~50 VGPR  (reuse 1.33, mid occ)
-                //   2x2 : 4 frag/warp, 16 waves/wg, ~30 VGPR  (reuse 1.00, high occ)
-                //   4x4 : 16 frag/warp, 4 waves/wg, ~80 VGPR  (reuse 2.00, low occ)
+                // Warp-tile (C_ROWS x C_COLS) sweep -- reuse vs. occupancy.
+                // Warp-tile reuse = (cR*cC)/(cR+cC) MACs per loaded fragment.
+                // 4x2/2x2/4x4 keep a 128x128 block tile (WG_H*cR = WG_W*cC = 8).
+                // 1x1/2x1 would need 64/32 waves/wg (>1024 threads) to keep
+                // 128x128, so they use a smaller tile at max occupancy (16 waves)
+                // -- their block-level reuse is also lower (note when comparing).
+                //   1x1 :  1 frag/warp, 16 waves/wg, ~18 VGPR (reuse 0.50) TILE 64x64
+                //   2x1 :  2 frag/warp, 16 waves/wg, ~22 VGPR (reuse 0.67) TILE 128x64
+                //   2x2 :  4 frag/warp, 16 waves/wg, ~30 VGPR (reuse 1.00) TILE 128x128
+                //   4x2 :  8 frag/warp,  8 waves/wg, ~50 VGPR (reuse 1.33) TILE 128x128
+                //   4x4 : 16 frag/warp,  4 waves/wg, ~80 VGPR (reuse 2.00) TILE 128x128
                 // { cR, cC, WG_W, WG_H, BK }
                 struct Cfg { uint32_t cR, cC, wgW, wgH, bk; };
                 const Cfg cfgs[] = {
-                    { 4, 2, 4, 2, 16 },   // 4x2: TILE 128x128, 8 frag/warp,  8 waves/wg
-                    { 2, 2, 4, 4, 16 },   // 2x2: TILE 128x128, 4 frag/warp, 16 waves/wg
+                    { 1, 1, 4, 4, 16 },   // 1x1: TILE  64x64,   1 frag/warp, 16 waves/wg
+                    { 2, 1, 4, 4, 16 },   // 2x1: TILE 128x64,   2 frag/warp, 16 waves/wg
+                    { 2, 2, 4, 4, 16 },   // 2x2: TILE 128x128,  4 frag/warp, 16 waves/wg
+                    { 4, 2, 4, 2, 16 },   // 4x2: TILE 128x128,  8 frag/warp,  8 waves/wg
                     { 4, 4, 2, 2, 16 },   // 4x4: TILE 128x128, 16 frag/warp,  4 waves/wg
                 };
                 double bestRate = 0.0, bestMs = 0.0, bestBW = 0.0; uint32_t bTileM = 0, bTileN = 0;
