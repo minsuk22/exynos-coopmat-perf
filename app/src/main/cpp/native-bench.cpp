@@ -1549,9 +1549,9 @@ static std::string runBenchmark(const std::string &shaderDir) {
                          componentTypeName(combo.outputType), tiled ? "v07 WMMA tiled" : "simple WMMA");
                 if (!have16) { rep.line("  no 16x16x16 subgroup shape; skip"); continue; }
 
-                // Show the shader source for this data type.
-                dumpTypedShaderSource(shaderDir, tiled ? "gemm_v07.comp" : "gemm_coopmat.comp",
-                                      glslTypeName(combo.inputType), glslTypeName(combo.outputType), rep);
+                // (kernel source dump disabled)
+                // dumpTypedShaderSource(shaderDir, tiled ? "gemm_v07.comp" : "gemm_coopmat.comp",
+                //                       glslTypeName(combo.inputType), glslTypeName(combo.outputType), rep);
 
                 std::string path = shaderDir + "/" + (tiled ? combo.shmemSpvFile : combo.spvFile);
                 std::ifstream f(path, std::ios::binary | std::ios::ate);
@@ -1584,11 +1584,18 @@ static std::string runBenchmark(const std::string &shaderDir) {
                 // 64 waves, >=512 waves). { cR, cC, WG_W, WG_H, BK }.
                 //  - {4,2,4,2,16}: TILE 128x128, 8 frag, 8 waves/wg -> 512 waves,
                 //    ~1.3KB LDS/wave, ~50 VGPR  (primary)
+                // Warp-tile (C_ROWS x C_COLS) sweep, all keeping a 128x128 block
+                // tile (WG sized so WG_H*cR = WG_W*cC = 8). This isolates the
+                // warp-tile reuse vs. occupancy trade-off:
+                //   4x2 : 8 frag/warp,  8 waves/wg, ~50 VGPR  (reuse 1.33, mid occ)
+                //   2x2 : 4 frag/warp, 16 waves/wg, ~30 VGPR  (reuse 1.00, high occ)
+                //   4x4 : 16 frag/warp, 4 waves/wg, ~80 VGPR  (reuse 2.00, low occ)
+                // { cR, cC, WG_W, WG_H, BK }
                 struct Cfg { uint32_t cR, cC, wgW, wgH, bk; };
                 const Cfg cfgs[] = {
-                    { 4, 2, 4, 2, 16 },   // TILE 128x128, 8 frag/warp, 8 waves/wg -> 512 waves
-                    { 2, 2, 4, 4, 16 },   // TILE 128x128, 4 frag/warp, 16 waves/wg (more occupancy)
-                    { 4, 2, 4, 2, 32 },   // TILE 128x128, BK=32 (more reuse, ~2KB LDS/wave)
+                    { 4, 2, 4, 2, 16 },   // 4x2: TILE 128x128, 8 frag/warp,  8 waves/wg
+                    { 2, 2, 4, 4, 16 },   // 2x2: TILE 128x128, 4 frag/warp, 16 waves/wg
+                    { 4, 4, 2, 2, 16 },   // 4x4: TILE 128x128, 16 frag/warp,  4 waves/wg
                 };
                 double bestRate = 0.0, bestMs = 0.0, bestBW = 0.0; uint32_t bTileM = 0, bTileN = 0;
                 bool dumpedExec = false;   // dump GPU ISA (sp3) once per type
@@ -1677,16 +1684,12 @@ static std::string runBenchmark(const std::string &shaderDir) {
                     if (vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &cpci2, nullptr, &pipeline) != VK_SUCCESS) {
                         rep.line("  cfg pipeline create failed"); freeBufDL(bA); freeBufDL(bB); freeBufDL(bC); freeBufDL(bD); continue;
                     }
-                    // GPU ISA (sp3) once per type; statistics (VGPR/SGPR) per config.
-                    if (wantPipeExec) {
-                        if (!dumpedExec) {
-                            rep.line("    -- compiled GPU executable (ISA / sp3, statistics) --");
-                            dumpPipelineExecutables(device, pipeline, rep, pfnPeProps, pfnPeStats, pfnPeIR);
-                            dumpedExec = true;
-                        } else {
-                            dumpPipelineStatsOnly(device, pipeline, rep, "stat", pfnPeProps, pfnPeStats);
-                        }
-                    }
+                    // sp3 / ISA dump disabled. Keep only the per-config VGPR/SGPR
+                    // statistics (lightweight, no ISA text) for the occupancy
+                    // comparison between 4x2 / 2x2 / 4x4.
+                    if (wantPipeExec)
+                        dumpPipelineStatsOnly(device, pipeline, rep, "stat", pfnPeProps, pfnPeStats);
+                    (void)dumpedExec;
 
                     uint32_t gx = N / tileN, gy = M / tileM;
                     VkResult wr = VK_SUCCESS;
@@ -1864,11 +1867,13 @@ static std::string runBenchmark(const std::string &shaderDir) {
                 }
             };
 
-            benchGemm(true);   // Test 3: MATMUL with WMMA (v07 tiled GEMM, 1024^3)
-            benchFma();        // Test 4: MATMUL with FMA  (v06 GEMM, 1024^3)
-            (void)benchGemm;   // benchGemm(false) (simple WMMA) intentionally not run
+            // Only the WMMA matmul runs, sweeping warp-tile 4x2 / 2x2 / 4x4.
+            benchGemm(true);   // MATMUL with WMMA (v07 tiled GEMM, 1024^3)
+            // benchFma();     // FMA GEMM disabled
+            (void)benchGemm; (void)benchFma;   // benchGemm(false)/benchFma not run
         }
 
+#if 0   // ===== WMMA peak throughput DISABLED (only the WMMA matmul sweep runs) =====
         // ===================== WMMA peak throughput =====================
         // Pure-compute peak on the cooperative-matrix (matrix) unit: load a 16x16
         // tile once into registers and repeat coopMatMulAdd REPEATS times (no
@@ -2015,25 +2020,21 @@ static std::string runBenchmark(const std::string &shaderDir) {
             }
 
         }
+#endif  // ===== end disabled WMMA peak throughput =====
+        (void)sumPeakWmma; (void)sumMatFma;   // tests disabled; arrays unused
 
         // ============================ FINAL SUMMARY ============================
-        // Four tests, grouped per data type. fp16 rows are TFLOPS, the s8 row is
-        // TOPS; both count 2 ops per multiply-add (a MAC = 2 ops).
+        // Best WMMA matmul (across the 4x2 / 2x2 / 4x4 warp-tile sweep) per type.
         {
             rep.line("");
             rep.line("============================ SUMMARY ============================");
-            rep.line("(fp16 -> TFLOPS, s8 -> TOPS; 2 ops per multiply-add)");
-            auto prRow = [&](const char *name, double v, const char *unit) {
-                if (v >= 0.0) rep.line("  %-24s : %8.2f %s", name, v, unit);
-                else          rep.line("  %-24s : %8s", name, "n/a");
-            };
+            rep.line("(fp16 -> TFLOPS, s8 -> TOPS; 2 ops per multiply-add; best of 4x2/2x2/4x4)");
             for (int ti = 0; ti < NUM_TY; ++ti) {
                 const char *unit = kTyFloat[ti] ? "TFLOPS" : "TOPS";
-                rep.line("");
-                rep.line("%s", kTyLabel[ti]);
-                prRow("Peak WMMA Throughput", sumPeakWmma[ti], unit);
-                prRow("MATMUL with WMMA",     sumMatWmma[ti],  unit);
-                prRow("MATMUL with FMA",      sumMatFma[ti],   unit);
+                if (sumMatWmma[ti] >= 0.0)
+                    rep.line("  %-18s  MATMUL with WMMA : %8.2f %s", kTyLabel[ti], sumMatWmma[ti], unit);
+                else
+                    rep.line("  %-18s  MATMUL with WMMA : %8s", kTyLabel[ti], "n/a");
             }
             rep.line("================================================================");
         }
