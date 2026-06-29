@@ -1756,13 +1756,19 @@ static std::string runBenchmark(const std::string &shaderDir) {
             auto benchFma = [&]() {
                 rep.line("");
                 rep.line("########## v06 FMA GEMM (no WMMA; scalar multiply-add) ##########");
-                // Tuned for wave64 / 1024^3 (64 VGPR, 2KB LDS/wave for 64 waves,
-                // >=512 waves). { BM, BN, BK, TM, TN }.
+                // FMA-NATURAL configs (all WMMA-matching constraints removed):
+                // TM=TN=8 (64 outputs/thread, register reuse = TM*TN/(TM+TN) = 4.0,
+                // vs the old WMMA-style 8x4 = 2.67), and BK swept freely. Larger BK
+                // means fewer barriers (barriers/wg = 2*K/BK) and more reuse per
+                // staged slab, at the cost of more LDS. { BM, BN, BK, TM, TN }.
                 struct FCfg { uint32_t BM, BN, BK, TM, TN; };
                 const FCfg cfgs[] = {
-                    { 128, 128, 16, 8, 4 },  // 512 threads/wg (8 waves) -> 512 waves, ~1KB LDS/wave
-                    { 128, 128, 8,  8, 4 },  // smaller LDS
-                    { 128, 64, 16, 8, 4 },   // 256 threads/wg, 128 wg -> 512 waves
+                    { 128, 128,  8, 8, 8 },  // 256 thr, reuse 4.0, barriers/wg=2*K/8
+                    { 128, 128, 16, 8, 8 },  // 256 thr, reuse 4.0, barriers/wg=2*K/16
+                    { 128, 128, 32, 8, 8 },  // 256 thr, reuse 4.0, barriers/wg=2*K/32 (fewest syncs)
+                    {  64,  64, 16, 8, 8 },  //  64 thr, high occupancy
+                    { 128,  64, 16, 8, 8 },  // 128 thr
+                    { 128, 128, 16, 8, 4 },  // old WMMA-style 8x4 (512 thr) for reference
                 };
                 for (const auto &combo : kCombos) {
                     if (combo.isFloat && !canFloat) continue;
@@ -1770,13 +1776,13 @@ static std::string runBenchmark(const std::string &shaderDir) {
                     int tyIdx = tyIndexOf(combo.inputType, combo.outputType);
                     if (tyIdx < 0) continue;   // only the three summarized data types
                     rep.line("");
-                    rep.line("---- %s*%s -> %s [optimized FMA matmul 1024^3] ----",
+                    rep.line("---- %s*%s -> %s [optimized FMA matmul %ux%ux%u] ----",
                              componentTypeName(combo.inputType), componentTypeName(combo.inputType),
-                             componentTypeName(combo.outputType));
-                    // Show the shader source for this data type.
-                    dumpTypedShaderSource(shaderDir, "fma_v06.comp",
-                                          glslTypeName(combo.inputType),
-                                          glslTypeName(combo.outputType), rep);
+                             componentTypeName(combo.outputType), MM, NN, KK);
+                    // (kernel source dump disabled)
+                    // dumpTypedShaderSource(shaderDir, "fma_v06.comp",
+                    //                       glslTypeName(combo.inputType),
+                    //                       glslTypeName(combo.outputType), rep);
                     std::string path = shaderDir + "/" + combo.fmaSpvFile;
                     std::ifstream f(path, std::ios::binary | std::ios::ate);
                     if (!f) { rep.line("  shader not found: %s", path.c_str()); continue; }
@@ -1832,16 +1838,19 @@ static std::string runBenchmark(const std::string &shaderDir) {
                             rep.line("  [BM%u BN%u BK%u TM%u TN%u] pipeline create failed", BM, BN, BK, TM, TN);
                             freeBufDL(bA); freeBufDL(bB); freeBufDL(bC); freeBufDL(bD); continue;
                         }
-                        rep.line("  [BM%u BN%u BK%u TM%u TN%u] threads/wg=%u", BM, BN, BK, TM, TN, localX);
-                        if (wantPipeExec) {
-                            if (!dumpedIsa) {   // full ISA (sp3) once per type
-                                rep.line("    -- compiled GPU executable (ISA / sp3, statistics) --");
-                                dumpPipelineExecutables(device, pipeline, rep, pfnPeProps, pfnPeStats, pfnPeIR);
-                                dumpedIsa = true;
-                            } else {
-                                dumpPipelineStatsOnly(device, pipeline, rep, "stat", pfnPeProps, pfnPeStats);
-                            }
-                        }
+                        // barrier()/syncthreads count: 2 per K-step, K/BK steps.
+                        uint64_t barPerWg = 2ull * (uint64_t)(K / BK);
+                        uint64_t wgs = (uint64_t)(M / BM) * (uint64_t)(N / BN);
+                        double reuse = (double)(TM * TN) / (double)(TM + TN);
+                        rep.line("  [BM%u BN%u BK%u TM%u TN%u] threads/wg=%u, reg-reuse=%.2f | "
+                                 "barriers/wg=2*K/BK=%llu, workgroups=%llu, total syncs=%llu",
+                                 BM, BN, BK, TM, TN, localX, reuse,
+                                 (unsigned long long)barPerWg, (unsigned long long)wgs,
+                                 (unsigned long long)(barPerWg * wgs));
+                        // sp3 / ISA dump disabled; keep lightweight per-config stats.
+                        if (wantPipeExec)
+                            dumpPipelineStatsOnly(device, pipeline, rep, "stat", pfnPeProps, pfnPeStats);
+                        (void)dumpedIsa;
 
                         uint32_t gx = N / BN, gy = M / BM;
                         VkResult wr = VK_SUCCESS;
@@ -1973,9 +1982,9 @@ static std::string runBenchmark(const std::string &shaderDir) {
                 }
             };
 
-            // Only the scalar tiled GEMM runs, sweeping square 2D block size.
-            benchTiledScalar();
-            (void)benchGemm; (void)benchFma;   // WMMA / FMA GEMM kept but not run
+            // Optimized FMA GEMM (all WMMA constraints removed), 2048^3.
+            benchFma();
+            (void)benchGemm; (void)benchTiledScalar;   // WMMA / scalar tiled kept but not run
         }
 
 #if 0   // ===== WMMA peak throughput DISABLED (only the WMMA matmul sweep runs) =====
@@ -2129,17 +2138,17 @@ static std::string runBenchmark(const std::string &shaderDir) {
         (void)sumPeakWmma; (void)sumMatFma;   // tests disabled; arrays unused
 
         // ============================ FINAL SUMMARY ============================
-        // Best scalar tiled GEMM (across the 8/16/24/32 block-size sweep) per type.
+        // Best optimized FMA GEMM (across the config sweep) per data type.
         {
             rep.line("");
             rep.line("============================ SUMMARY ============================");
-            rep.line("(fp16 -> TFLOPS, s8 -> TOPS; 2 ops per multiply-add; best block size)");
+            rep.line("(fp16 -> TFLOPS, s8 -> TOPS; 2 ops per multiply-add; best FMA config)");
             for (int ti = 0; ti < NUM_TY; ++ti) {
                 const char *unit = kTyFloat[ti] ? "TFLOPS" : "TOPS";
-                if (sumMatWmma[ti] >= 0.0)
-                    rep.line("  %-18s  Tiled GEMM (best blk) : %8.2f %s", kTyLabel[ti], sumMatWmma[ti], unit);
+                if (sumMatFma[ti] >= 0.0)
+                    rep.line("  %-18s  FMA GEMM (best cfg) : %8.2f %s", kTyLabel[ti], sumMatFma[ti], unit);
                 else
-                    rep.line("  %-18s  Tiled GEMM (best blk) : %8s", kTyLabel[ti], "n/a");
+                    rep.line("  %-18s  FMA GEMM (best cfg) : %8s", kTyLabel[ti], "n/a");
             }
             rep.line("================================================================");
         }
