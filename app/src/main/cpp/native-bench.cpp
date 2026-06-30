@@ -1765,7 +1765,7 @@ static std::string runBenchmark(const std::string &shaderDir) {
                 // means fewer barriers (barriers/wg = 2*K/BK) and more reuse per
                 // staged slab, at the cost of more LDS. { BM, BN, BK, TM, TN }.
                 struct FCfg { uint32_t BM, BN, BK, TM, TN; };
-                const FCfg cfgs[] = {
+                const FCfg scalarCfgs[] = {
                     { 128, 128,  8, 8, 8 },  // 256 thr, reuse 4.0, barriers/wg=2*K/8
                     { 128, 128, 16, 8, 8 },  // 256 thr, reuse 4.0, barriers/wg=2*K/16
                     { 128, 128, 32, 8, 8 },  // 256 thr, reuse 4.0, barriers/wg=2*K/32 (fewest syncs)
@@ -1773,6 +1773,19 @@ static std::string runBenchmark(const std::string &shaderDir) {
                     { 128,  64, 16, 8, 8 },  // 128 thr
                     { 128, 128, 16, 8, 4 },  // old WMMA-style 8x4 (512 thr) for reference
                 };
+                // vec4 path: TM/TN sweep with BM=BN=128, BK=16 fixed (isolate TM/TN).
+                // threads/wg = (128/TM)*(128/TN); reg-reuse = TM*TN/(TM+TN).
+                const FCfg vecCfgs[] = {
+                    { 128, 128, 16,  4,  4 },  // 1024 thr, reuse 2.00
+                    { 128, 128, 16,  4,  8 },  //  512 thr, reuse 2.67
+                    { 128, 128, 16,  8,  4 },  //  512 thr, reuse 2.67
+                    { 128, 128, 16,  8,  8 },  //  256 thr, reuse 4.00
+                    { 128, 128, 16,  4, 16 },  //  256 thr, reuse 3.20
+                    { 128, 128, 16, 16,  4 },  //  256 thr, reuse 3.20
+                };
+                const FCfg *cfgs = vec ? vecCfgs : scalarCfgs;
+                size_t ncfgs = vec ? (sizeof(vecCfgs) / sizeof(vecCfgs[0]))
+                                   : (sizeof(scalarCfgs) / sizeof(scalarCfgs[0]));
                 for (const auto &combo : kCombos) {
                     if (combo.isFloat && !canFloat) continue;
                     if (!combo.isFloat && !canInt) continue;
@@ -1799,7 +1812,8 @@ static std::string runBenchmark(const std::string &shaderDir) {
                     double bestRate = 0.0, bestMs = 0.0, bestBW = 0.0; uint32_t bBM = 0, bBN = 0;
                     bool dumpedIsa = false;   // dump the GPU ISA (sp3) once per type
 
-                    for (const auto &cfg : cfgs) {
+                    for (size_t ci = 0; ci < ncfgs; ++ci) {
+                        const FCfg &cfg = cfgs[ci];
                         uint32_t BM = cfg.BM, BN = cfg.BN, BK = cfg.BK, TM = cfg.TM, TN = cfg.TN;
                         uint32_t localX = (BM / TM) * (BN / TN);
                         auto rup = [](uint32_t v, uint32_t a) { return (v + a - 1) / a * a; };
