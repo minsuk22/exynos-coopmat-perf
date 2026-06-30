@@ -1,0 +1,87 @@
+/*
+ * INNER-PRODUCT FMA GEMM -- identical to fma_v06.comp except the micro-kernel
+ * loop order. Here each output is computed as a dot product over the BK slab
+ * (i,j outer, k inner), instead of the outer-product (k outer, rank-1 update).
+ * Same block tile, same thread tile, same shared staging (A transposed) -- so a
+ * head-to-head run isolates the effect of inner- vs outer-product ordering.
+ *
+ *   outer (fma_v06): for k:   ar[i],br[j];  acc[i][j] += ar[i]*br[j]
+ *   inner (this)   : for i,j:  s=0; for k: s += As[k][i]*Bs[k][j]; acc[i][j]+=s
+ *
+ * Reuse note: the outer-product loads TM+TN operands per k and does TM*TN FMAs
+ * (reuse TM*TN/(TM+TN)); the inner-product reads As/Bs per (i,j,k) -- reuse 0.5
+ * unless the compiler hoists the As[k][i] read across j.
+ *
+ * Defines: A_TYPE (input), C_TYPE (accumulator/output).
+ */
+#version 450 core
+#extension GL_EXT_shader_explicit_arithmetic_types : enable
+#extension GL_EXT_control_flow_attributes : enable
+
+layout(constant_id = 0) const uint M  = 2048;
+layout(constant_id = 1) const uint N  = 2048;
+layout(constant_id = 2) const uint K  = 2048;
+layout(constant_id = 3) const uint BM = 128;
+layout(constant_id = 4) const uint BN = 128;
+layout(constant_id = 5) const uint BK = 16;
+layout(constant_id = 6) const uint TM = 8;
+layout(constant_id = 7) const uint TN = 8;
+layout(local_size_x_id = 8, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly  buffer BufA { A_TYPE a[]; };
+layout(set = 0, binding = 1) readonly  buffer BufB { A_TYPE b[]; };
+layout(set = 0, binding = 2) readonly  buffer BufC { C_TYPE c[]; };
+layout(set = 0, binding = 3) writeonly buffer BufD { C_TYPE d[]; };
+
+const uint PAD = 4u;
+const uint SA = BM + PAD;             // As row stride (transposed: As[k][m])
+const uint SB = BN + PAD;             // Bs row stride (Bs[k][n])
+shared A_TYPE As[BK * (BM + PAD)];
+shared A_TYPE Bs[BK * (BN + PAD)];
+
+void main()
+{
+    uint nthreads = gl_WorkGroupSize.x;
+    uint tid      = gl_LocalInvocationID.x;
+    uint threadsX = BN / TN;
+    uint tcol     = tid % threadsX;
+    uint trow     = tid / threadsX;
+    uint rowBase  = gl_WorkGroupID.y * BM;
+    uint colBase  = gl_WorkGroupID.x * BN;
+
+    C_TYPE acc[TM][TN];
+    [[unroll]] for (uint i = 0; i < TM; ++i)
+        [[unroll]] for (uint j = 0; j < TN; ++j) acc[i][j] = C_TYPE(0);
+
+    for (uint k0 = 0; k0 < K; k0 += BK) {
+        barrier();
+        for (uint idx = tid; idx < BM * BK; idx += nthreads) {
+            uint m = idx / BK, kk = idx % BK;
+            As[kk * SA + m] = a[(rowBase + m) * K + (k0 + kk)];
+        }
+        for (uint idx = tid; idx < BK * BN; idx += nthreads) {
+            uint kk = idx / BN, n = idx % BN;
+            Bs[kk * SB + n] = b[(k0 + kk) * N + (colBase + n)];
+        }
+        barrier();
+
+        // INNER PRODUCT: a full dot over the BK slab per output element.
+        [[unroll]] for (uint i = 0; i < TM; ++i) {
+            [[unroll]] for (uint j = 0; j < TN; ++j) {
+                C_TYPE s = C_TYPE(0);
+                [[unroll]] for (uint kk = 0; kk < BK; ++kk)
+                    s += C_TYPE(As[kk * SA + (trow * TM + i)]) *
+                         C_TYPE(Bs[kk * SB + (tcol * TN + j)]);
+                acc[i][j] += s;
+            }
+        }
+    }
+
+    [[unroll]] for (uint i = 0; i < TM; ++i) {
+        uint gi = rowBase + trow * TM + i;
+        [[unroll]] for (uint j = 0; j < TN; ++j) {
+            uint gj = colBase + tcol * TN + j;
+            d[gi * N + gj] = acc[i][j];
+        }
+    }
+}

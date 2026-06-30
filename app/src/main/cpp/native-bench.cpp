@@ -315,16 +315,17 @@ struct TypeCombo {
     const char *spvFile;       // simple GEMM (streams A/B from global)
     const char *peakSpvFile;   // WMMA peak microbenchmark shader
     const char *shmemSpvFile;  // shared-memory tiled GEMM (WMMA)
-    const char *fmaSpvFile;    // scalar FMA/MAD GEMM (no WMMA)
+    const char *fmaSpvFile;    // scalar outer-product FMA GEMM (no WMMA)
     const char *fmaVecSpvFile; // vectorized (vec4 / packed-dot / dp4a) FMA GEMM
+    const char *fmaInnerSpvFile; // scalar inner-product (dot-per-output) FMA GEMM
     bool isFloat;
 };
 
 static const TypeCombo kCombos[] = {
-    { VK_COMPONENT_TYPE_FLOAT16_KHR, VK_COMPONENT_TYPE_FLOAT32_KHR, "gemm_fp16_fp32.spv", "wmma_peak_fp16_fp32.spv", "gemm_v07_fp16_fp32.spv", "fma_v06_fp16_fp32.spv", "fma_vec4_fp16_fp32.spv", true },
-    { VK_COMPONENT_TYPE_FLOAT16_KHR, VK_COMPONENT_TYPE_FLOAT16_KHR, "gemm_fp16_fp16.spv", "wmma_peak_fp16_fp16.spv", "gemm_v07_fp16_fp16.spv", "fma_v06_fp16_fp16.spv", "fma_vec4_fp16_fp16.spv", true },
-    { VK_COMPONENT_TYPE_SINT8_KHR,   VK_COMPONENT_TYPE_SINT32_KHR,  "gemm_s8_s32.spv",   "wmma_peak_s8_s32.spv",   "gemm_v07_s8_s32.spv",   "fma_v06_s8_s32.spv",   "fma_vec4_s8_s32.spv",   false },
-    { VK_COMPONENT_TYPE_UINT8_KHR,   VK_COMPONENT_TYPE_UINT32_KHR,  "gemm_u8_u32.spv",   "wmma_peak_u8_u32.spv",   "gemm_v07_u8_u32.spv",   "fma_v06_u8_u32.spv",   "fma_vec4_u8_u32.spv",   false },
+    { VK_COMPONENT_TYPE_FLOAT16_KHR, VK_COMPONENT_TYPE_FLOAT32_KHR, "gemm_fp16_fp32.spv", "wmma_peak_fp16_fp32.spv", "gemm_v07_fp16_fp32.spv", "fma_v06_fp16_fp32.spv", "fma_vec4_fp16_fp32.spv", "fma_inner_fp16_fp32.spv", true },
+    { VK_COMPONENT_TYPE_FLOAT16_KHR, VK_COMPONENT_TYPE_FLOAT16_KHR, "gemm_fp16_fp16.spv", "wmma_peak_fp16_fp16.spv", "gemm_v07_fp16_fp16.spv", "fma_v06_fp16_fp16.spv", "fma_vec4_fp16_fp16.spv", "fma_inner_fp16_fp16.spv", true },
+    { VK_COMPONENT_TYPE_SINT8_KHR,   VK_COMPONENT_TYPE_SINT32_KHR,  "gemm_s8_s32.spv",   "wmma_peak_s8_s32.spv",   "gemm_v07_s8_s32.spv",   "fma_v06_s8_s32.spv",   "fma_vec4_s8_s32.spv",   "fma_inner_s8_s32.spv",   false },
+    { VK_COMPONENT_TYPE_UINT8_KHR,   VK_COMPONENT_TYPE_UINT32_KHR,  "gemm_u8_u32.spv",   "wmma_peak_u8_u32.spv",   "gemm_v07_u8_u32.spv",   "fma_v06_u8_u32.spv",   "fma_vec4_u8_u32.spv",   "fma_inner_u8_u32.spv",   false },
 };
 
 static int32_t findMemoryType(const VkPhysicalDeviceMemoryProperties &mp,
@@ -1753,12 +1754,14 @@ static std::string runBenchmark(const std::string &shaderDir) {
                 if (tiled && bestRate > 0.0) sumMatWmma[tyIdx] = bestRate;   // Test 3 result
               }
             };
-            // FMA/MAD GEMM (no WMMA). vec=false: scalar v06 (acc += ar*br).
-            // vec=true: vectorized fma_vec4 (coalesced vec4 loads + packed dot/dp4a).
-            auto benchFma = [&](bool vec) {
+            // FMA/MAD GEMM (no WMMA). kind: 0 = outer-product (fma_v06, acc+=ar*br),
+            // 1 = inner-product (fma_inner, dot per output), 2 = vec4 (fma_vec4).
+            auto benchFma = [&](int kind) {
+                bool vec = (kind == 2);
                 rep.line("");
-                rep.line(vec ? "########## vectorized FMA GEMM (vec4 coalesced + packed dot/dp4a) ##########"
-                             : "########## scalar FMA GEMM (no WMMA; acc += ar*br) ##########");
+                rep.line(kind == 2 ? "########## vec4 FMA GEMM (coalesced + packed dot/dp4a) ##########"
+                       : kind == 1 ? "########## INNER-product FMA GEMM (dot per output) ##########"
+                                   : "########## OUTER-product FMA GEMM (acc += ar*br) ##########");
                 // FMA-NATURAL configs (all WMMA-matching constraints removed):
                 // TM=TN=8 (64 outputs/thread, register reuse = TM*TN/(TM+TN) = 4.0,
                 // vs the old WMMA-style 8x4 = 2.67), and BK swept freely. Larger BK
@@ -1792,11 +1795,15 @@ static std::string runBenchmark(const std::string &shaderDir) {
                     int tyIdx = tyIndexOf(combo.inputType, combo.outputType);
                     if (tyIdx < 0) continue;   // only the three summarized data types
                     rep.line("");
+                    const char *kindName = kind == 2 ? "vec4" : kind == 1 ? "inner" : "outer";
                     rep.line("---- %s*%s -> %s [%s FMA matmul %ux%ux%u] ----",
                              componentTypeName(combo.inputType), componentTypeName(combo.inputType),
-                             componentTypeName(combo.outputType), vec ? "vec4" : "scalar", MM, NN, KK);
+                             componentTypeName(combo.outputType), kindName, MM, NN, KK);
                     // (kernel source dump disabled)
-                    std::string path = shaderDir + "/" + (vec ? combo.fmaVecSpvFile : combo.fmaSpvFile);
+                    const char *spvFile = kind == 2 ? combo.fmaVecSpvFile
+                                        : kind == 1 ? combo.fmaInnerSpvFile
+                                                    : combo.fmaSpvFile;
+                    std::string path = shaderDir + "/" + spvFile;
                     std::ifstream f(path, std::ios::binary | std::ios::ate);
                     if (!f) { rep.line("  shader not found: %s", path.c_str()); continue; }
                     std::streamsize sz = f.tellg(); f.seekg(0);
@@ -1893,7 +1900,11 @@ static std::string runBenchmark(const std::string &shaderDir) {
                     if (bestRate > 0.0)
                         rep.line("  BEST: BM%u BN%u  %.4f ms/matmul | %.2f %s = %.2f TMAC/s | min DRAM BW=%.1f GB/s",
                                  bBM, bBN, bestMs, bestRate, rateUnit, bestRate / 2.0, bestBW);
-                    if (bestRate > 0.0) { if (vec) sumMatWmma[tyIdx] = bestRate; else sumMatFma[tyIdx] = bestRate; }
+                    if (bestRate > 0.0) {
+                        if (kind == 2) sumMatWmma[tyIdx] = bestRate;       // vec4
+                        else if (kind == 1) sumPeakWmma[tyIdx] = bestRate; // inner
+                        else sumMatFma[tyIdx] = bestRate;                  // outer
+                    }
                 }
             };
 
@@ -1996,9 +2007,10 @@ static std::string runBenchmark(const std::string &shaderDir) {
                 }
             };
 
-            // Scalar v06 vs. vectorized (vec4 coalesced + packed dot/dp4a), 2048^3.
-            benchFma(false);   // scalar  -> sumMatFma
-            benchFma(true);    // vec4    -> sumMatWmma
+            // Outer-product vs inner-product FMA GEMM, 2048^3 (same tile/staging).
+            benchFma(0);   // outer (fma_v06)   -> sumMatFma
+            benchFma(1);   // inner (fma_inner) -> sumPeakWmma
+            // benchFma(2);  // vec4 (fma_vec4) kept available but not run this time
             (void)benchGemm; (void)benchTiledScalar;   // WMMA / scalar tiled kept but not run
         }
 
@@ -2153,22 +2165,22 @@ static std::string runBenchmark(const std::string &shaderDir) {
         (void)sumPeakWmma; (void)sumMatFma;   // tests disabled; arrays unused
 
         // ============================ FINAL SUMMARY ============================
-        // Scalar FMA vs. vectorized (vec4 + packed dot/dp4a), best config per type.
+        // Outer-product vs inner-product FMA GEMM, best config per type.
         {
             rep.line("");
-            rep.line("==================== SUMMARY: scalar vs vec4 FMA ====================");
+            rep.line("================= SUMMARY: outer vs inner product =================");
             rep.line("(fp16 -> TFLOPS, s8 -> TOPS; 2 ops/MAC; best config of each)");
-            rep.line("  %-18s %12s %12s %10s", "type", "scalar", "vec4", "speedup");
+            rep.line("  %-18s %12s %12s %12s", "type", "outer", "inner", "outer/inner");
             for (int ti = 0; ti < NUM_TY; ++ti) {
                 const char *unit = kTyFloat[ti] ? "TFLOPS" : "TOPS";
-                double sc = sumMatFma[ti], ve = sumMatWmma[ti];
-                char scb[24], veb[24], spb[16];
-                if (sc >= 0.0) snprintf(scb, sizeof scb, "%.2f %s", sc, unit); else snprintf(scb, sizeof scb, "n/a");
-                if (ve >= 0.0) snprintf(veb, sizeof veb, "%.2f %s", ve, unit); else snprintf(veb, sizeof veb, "n/a");
-                if (sc > 0.0 && ve >= 0.0) snprintf(spb, sizeof spb, "%.2fx", ve / sc); else snprintf(spb, sizeof spb, "-");
-                rep.line("  %-18s %12s %12s %10s", kTyLabel[ti], scb, veb, spb);
+                double ou = sumMatFma[ti], in = sumPeakWmma[ti];
+                char oub[24], inb[24], rab[16];
+                if (ou >= 0.0) snprintf(oub, sizeof oub, "%.2f %s", ou, unit); else snprintf(oub, sizeof oub, "n/a");
+                if (in >= 0.0) snprintf(inb, sizeof inb, "%.2f %s", in, unit); else snprintf(inb, sizeof inb, "n/a");
+                if (ou >= 0.0 && in > 0.0) snprintf(rab, sizeof rab, "%.2fx", ou / in); else snprintf(rab, sizeof rab, "-");
+                rep.line("  %-18s %12s %12s %12s", kTyLabel[ti], oub, inb, rab);
             }
-            rep.line("====================================================================");
+            rep.line("==================================================================");
         }
 
         vkDestroyCommandPool(device, cmdPool, nullptr);
